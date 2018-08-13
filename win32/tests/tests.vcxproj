@@ -10,9 +10,7 @@
   <PropertyGroup Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
   </PropertyGroup>
-  <PropertyGroup Label="UserMacros">
-    <NuGetPackageImportStamp>8e214174</NuGetPackageImportStamp>
-  </PropertyGroup>
+  <PropertyGroup Label="UserMacros" />
   <ItemDefinitionGroup>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -134,6 +132,7 @@
     <ClCompile Include="..\..\tests\0046-rkt_cache.c" />
     <ClCompile Include="..\..\tests\0047-partial_buf_tmout.c" />
     <ClCompile Include="..\..\tests\0048-partitioner.c" />
+    <ClCompile Include="..\..\tests\0049-consume_conn_close.c" />
     <ClCompile Include="..\..\tests\0050-subscribe_adds.c" />
     <ClCompile Include="..\..\tests\0051-assign_adds.c" />
     <ClCompile Include="..\..\tests\0052-msg_timestamps.c" />
@@ -163,7 +162,11 @@
     <ClCompile Include="..\..\tests\0077-compaction.c" />
     <ClCompile Include="..\..\tests\0078-c_from_cpp.cpp" />
     <ClCompile Include="..\..\tests\0079-fork.c" />
-    <ClCompile Include="..\..\tests\0081-fetch_max_bytes.cpp" />
+    <ClCompile Include="..\..\tests\0080-admin_ut.c" />
+    <ClCompile Include="..\..\tests\0081-admin.c" />
+    <ClCompile Include="..\..\tests\0082-fetch_max_bytes.cpp" />
+    <ClCompile Include="..\..\tests\0083-cb_event.c" />
+    <ClCompile Include="..\..\tests\0084-destroy_flags.c" />
     <ClCompile Include="..\..\tests\8000-idle.cpp" />
     <ClCompile Include="..\..\tests\test.c" />
     <ClCompile Include="..\..\tests\testcpp.cpp" />

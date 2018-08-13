@@ -69,7 +69,8 @@ void rd_kafka_q_destroy_final (rd_kafka_q_t *rkq) {
 /**
  * Initialize a queue.
  */
-void rd_kafka_q_init (rd_kafka_q_t *rkq, rd_kafka_t *rk) {
+void rd_kafka_q_init0 (rd_kafka_q_t *rkq, rd_kafka_t *rk,
+                       const char *func, int line) {
         rd_kafka_q_reset(rkq);
 	rkq->rkq_fwdq   = NULL;
         rkq->rkq_refcnt = 1;
@@ -80,6 +81,11 @@ void rd_kafka_q_init (rd_kafka_q_t *rkq, rd_kafka_t *rk) {
         rkq->rkq_opaque = NULL;
 	mtx_init(&rkq->rkq_lock, mtx_plain);
 	cnd_init(&rkq->rkq_cond);
+#if ENABLE_DEVEL
+        rd_snprintf(rkq->rkq_name, sizeof(rkq->rkq_name), "%s:%d", func, line);
+#else
+        rkq->rkq_name = func;
+#endif
 }
 
 
@@ -352,7 +358,8 @@ rd_kafka_op_t *rd_kafka_q_pop_serve (rd_kafka_q_t *rkq, int timeout_ms,
                                 res = rd_kafka_op_handle(rkq->rkq_rk, rkq, rko,
                                                          cb_type, opaque,
                                                          callback);
-                                if (res == RD_KAFKA_OP_RES_HANDLED)
+                                if (res == RD_KAFKA_OP_RES_HANDLED ||
+                                    res == RD_KAFKA_OP_RES_KEEP)
                                         goto retry; /* Next op */
                                 else if (unlikely(res ==
                                                   RD_KAFKA_OP_RES_YIELD)) {
@@ -556,8 +563,9 @@ int rd_kafka_q_serve_rkmessages (rd_kafka_q_t *rkq, int timeout_ms,
                 /* Serve non-FETCH callbacks */
                 res = rd_kafka_poll_cb(rk, rkq, rko,
                                        RD_KAFKA_Q_CB_RETURN, NULL);
-                if (res == RD_KAFKA_OP_RES_HANDLED) {
-                        /* Callback served, rko is destroyed. */
+                if (res == RD_KAFKA_OP_RES_KEEP ||
+                    res == RD_KAFKA_OP_RES_HANDLED) {
+                        /* Callback served, rko is destroyed (if HANDLED). */
                         continue;
                 } else if (unlikely(res == RD_KAFKA_OP_RES_YIELD ||
                                     rd_kafka_yield_thread)) {
@@ -599,7 +607,10 @@ int rd_kafka_q_serve_rkmessages (rd_kafka_q_t *rkq, int timeout_ms,
 
 
 void rd_kafka_queue_destroy (rd_kafka_queue_t *rkqu) {
-        rd_kafka_q_destroy_owner(rkqu->rkqu_q);
+        if (rkqu->rkqu_is_owner)
+                rd_kafka_q_destroy_owner(rkqu->rkqu_q);
+        else
+                rd_kafka_q_destroy(rkqu->rkqu_q);
         rd_free(rkqu);
 }
 
@@ -625,6 +636,7 @@ rd_kafka_queue_t *rd_kafka_queue_new (rd_kafka_t *rk) {
 	rkqu = rd_kafka_queue_new0(rk, rkq);
 	rd_kafka_q_destroy(rkq); /* Loose refcount from q_new, one is held
 				  * by queue_new0 */
+        rkqu->rkqu_is_owner = 1;
 	return rkqu;
 }
 
@@ -665,6 +677,14 @@ rd_kafka_queue_t *rd_kafka_queue_get_partition (rd_kafka_t *rk,
         return result;
 }
 
+rd_kafka_queue_t *rd_kafka_queue_get_background (rd_kafka_t *rk) {
+        if (rk->rk_background.q)
+                return rd_kafka_queue_new0(rk, rk->rk_background.q);
+        else
+                return NULL;
+}
+
+
 rd_kafka_resp_err_t rd_kafka_set_log_queue (rd_kafka_t *rk,
                                             rd_kafka_queue_t *rkqu) {
         rd_kafka_q_t *rkq;
@@ -699,6 +719,8 @@ void rd_kafka_q_io_event_enable (rd_kafka_q_t *rkq, int fd,
                 qio->fd = fd;
                 qio->size = size;
                 qio->payload = (void *)(qio+1);
+                qio->event_cb = NULL;
+                qio->event_cb_opaque = NULL;
                 memcpy(qio->payload, payload, size);
         }
 
@@ -719,6 +741,46 @@ void rd_kafka_q_io_event_enable (rd_kafka_q_t *rkq, int fd,
 void rd_kafka_queue_io_event_enable (rd_kafka_queue_t *rkqu, int fd,
                                      const void *payload, size_t size) {
         rd_kafka_q_io_event_enable(rkqu->rkqu_q, fd, payload, size);
+}
+
+
+/**
+ * @brief Enable or disable(event_cb==NULL) callback-based wake-ups for queue
+ */
+void rd_kafka_q_cb_event_enable (rd_kafka_q_t *rkq,
+                                 void (*event_cb) (rd_kafka_t *rk,
+                                                   void *opaque),
+                                 void *opaque) {
+        struct rd_kafka_q_io *qio = NULL;
+
+        if (event_cb) {
+                qio = rd_malloc(sizeof(*qio));
+                qio->fd = -1;
+                qio->size = 0;
+                qio->payload = NULL;
+                qio->event_cb = event_cb;
+                qio->event_cb_opaque = opaque;
+        }
+
+        mtx_lock(&rkq->rkq_lock);
+        if (rkq->rkq_qio) {
+                rd_free(rkq->rkq_qio);
+                rkq->rkq_qio = NULL;
+        }
+
+        if (event_cb) {
+                rkq->rkq_qio = qio;
+        }
+
+        mtx_unlock(&rkq->rkq_lock);
+
+}
+
+void rd_kafka_queue_cb_event_enable (rd_kafka_queue_t *rkqu,
+                                     void (*event_cb) (rd_kafka_t *rk,
+                                                       void *opaque),
+                                     void *opaque) {
+        rd_kafka_q_cb_event_enable (rkqu->rkqu_q, event_cb, opaque);
 }
 
 
@@ -863,4 +925,11 @@ void rd_kafka_q_dump (FILE *fp, rd_kafka_q_t *rkq) {
         }
 
         mtx_unlock(&rkq->rkq_lock);
+}
+
+
+void rd_kafka_enq_once_trigger_destroy (void *ptr) {
+        rd_kafka_enq_once_t *eonce = ptr;
+
+        rd_kafka_enq_once_trigger(eonce, RD_KAFKA_RESP_ERR__DESTROY, "destroy");
 }

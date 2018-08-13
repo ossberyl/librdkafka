@@ -78,11 +78,15 @@ struct rd_kafka_q_s {
 };
 
 
-/* FD-based application signalling state holder. */
+/* Application signalling state holder. */
 struct rd_kafka_q_io {
+        /* For FD-based signalling */
 	int    fd;
 	void  *payload;
 	size_t size;
+        /* For callback-based signalling */
+        void (*event_cb) (rd_kafka_t *rk, void *opaque);
+        void *event_cb_opaque;
 };
 
 
@@ -99,7 +103,9 @@ int rd_kafka_q_ready (rd_kafka_q_t *rkq) {
 
 
 
-void rd_kafka_q_init (rd_kafka_q_t *rkq, rd_kafka_t *rk);
+void rd_kafka_q_init0 (rd_kafka_q_t *rkq, rd_kafka_t *rk,
+                       const char *func, int line);
+#define rd_kafka_q_init(rkq,rk) rd_kafka_q_init0(rkq,rk,__FUNCTION__,__LINE__)
 rd_kafka_q_t *rd_kafka_q_new0 (rd_kafka_t *rk, const char *func, int line);
 #define rd_kafka_q_new(rk) rd_kafka_q_new0(rk,__FUNCTION__,__LINE__)
 void rd_kafka_q_destroy_final (rd_kafka_q_t *rkq);
@@ -281,6 +287,11 @@ void rd_kafka_q_io_event (rd_kafka_q_t *rkq) {
 	if (likely(!rkq->rkq_qio))
 		return;
 
+        if (rkq->rkq_qio->event_cb) {
+                rkq->rkq_qio->event_cb(rkq->rkq_rk, rkq->rkq_qio->event_cb_opaque);
+                return;
+        }
+
 #ifdef _MSC_VER
 	r = _write(rkq->rkq_qio->fd, rkq->rkq_qio->payload, (int)rkq->rkq_qio->size);
 #else
@@ -332,6 +343,65 @@ rd_kafka_q_enq0 (rd_kafka_q_t *rkq, rd_kafka_op_t *rko, int at_head) {
 
 
 /**
+ * @brief Enqueue \p rko either at head or tail of \p rkq.
+ *
+ * The provided \p rko is either enqueued or destroyed.
+ *
+ * \p orig_destq is the original (outermost) dest queue for which
+ * this op was enqueued, before any queue forwarding has kicked in.
+ * The rko_serve callback from the orig_destq will be set on the rko
+ * if there is no rko_serve callback already set, and the \p rko isn't
+ * failed because the final queue is disabled.
+ *
+ * @returns 1 if op was enqueued or 0 if queue is disabled and
+ * there was no replyq to enqueue on in which case the rko is destroyed.
+ *
+ * @locality any thread.
+ */
+static RD_INLINE RD_UNUSED
+int rd_kafka_q_enq1 (rd_kafka_q_t *rkq, rd_kafka_op_t *rko,
+                     rd_kafka_q_t *orig_destq, int at_head, int do_lock) {
+        rd_kafka_q_t *fwdq;
+
+        if (do_lock)
+                mtx_lock(&rkq->rkq_lock);
+
+        rd_dassert(rkq->rkq_refcnt > 0);
+
+        if (unlikely(!(rkq->rkq_flags & RD_KAFKA_Q_F_READY))) {
+                /* Queue has been disabled, reply to and fail the rko. */
+                if (do_lock)
+                        mtx_unlock(&rkq->rkq_lock);
+
+                return rd_kafka_op_reply(rko, RD_KAFKA_RESP_ERR__DESTROY);
+        }
+
+        if (!(fwdq = rd_kafka_q_fwd_get(rkq, 0))) {
+                if (!rko->rko_serve && orig_destq->rkq_serve) {
+                        /* Store original queue's serve callback and opaque
+                         * prior to forwarding. */
+                        rko->rko_serve = orig_destq->rkq_serve;
+                        rko->rko_serve_opaque = orig_destq->rkq_opaque;
+                }
+
+                rd_kafka_q_enq0(rkq, rko, at_head);
+                cnd_signal(&rkq->rkq_cond);
+                if (rkq->rkq_qlen == 1)
+                        rd_kafka_q_io_event(rkq);
+
+                if (do_lock)
+                        mtx_unlock(&rkq->rkq_lock);
+        } else {
+                if (do_lock)
+                        mtx_unlock(&rkq->rkq_lock);
+                rd_kafka_q_enq1(fwdq, rko, orig_destq, at_head, 1/*do lock*/);
+                rd_kafka_q_destroy(fwdq);
+        }
+
+        return 1;
+}
+
+/**
  * @brief Enqueue the 'rko' op at the tail of the queue 'rkq'.
  *
  * The provided 'rko' is either enqueued or destroyed.
@@ -339,44 +409,12 @@ rd_kafka_q_enq0 (rd_kafka_q_t *rkq, rd_kafka_op_t *rko, int at_head) {
  * @returns 1 if op was enqueued or 0 if queue is disabled and
  * there was no replyq to enqueue on in which case the rko is destroyed.
  *
- * Locality: any thread.
+ * @locality any thread.
+ * @locks rkq MUST NOT be locked
  */
 static RD_INLINE RD_UNUSED
 int rd_kafka_q_enq (rd_kafka_q_t *rkq, rd_kafka_op_t *rko) {
-	rd_kafka_q_t *fwdq;
-
-	mtx_lock(&rkq->rkq_lock);
-
-        rd_dassert(rkq->rkq_refcnt > 0);
-
-        if (unlikely(!(rkq->rkq_flags & RD_KAFKA_Q_F_READY))) {
-
-                /* Queue has been disabled, reply to and fail the rko. */
-                mtx_unlock(&rkq->rkq_lock);
-
-                return rd_kafka_op_reply(rko, RD_KAFKA_RESP_ERR__DESTROY);
-        }
-
-        if (!rko->rko_serve && rkq->rkq_serve) {
-                /* Store original queue's serve callback and opaque
-                 * prior to forwarding. */
-                rko->rko_serve = rkq->rkq_serve;
-                rko->rko_serve_opaque = rkq->rkq_opaque;
-        }
-
-	if (!(fwdq = rd_kafka_q_fwd_get(rkq, 0))) {
-		rd_kafka_q_enq0(rkq, rko, 0);
-		cnd_signal(&rkq->rkq_cond);
-		if (rkq->rkq_qlen == 1)
-			rd_kafka_q_io_event(rkq);
-		mtx_unlock(&rkq->rkq_lock);
-	} else {
-		mtx_unlock(&rkq->rkq_lock);
-		rd_kafka_q_enq(fwdq, rko);
-		rd_kafka_q_destroy(fwdq);
-	}
-
-        return 1;
+        return rd_kafka_q_enq1(rkq, rko, rkq, 0/*at tail*/, 1/*do lock*/);
 }
 
 
@@ -388,37 +426,12 @@ int rd_kafka_q_enq (rd_kafka_q_t *rkq, rd_kafka_op_t *rko) {
  * @returns 1 if op was enqueued or 0 if queue is disabled and
  * there was no replyq to enqueue on in which case the rko is destroyed.
  *
- * @locks rkq MUST BE LOCKED
- *
- * Locality: any thread.
+ * @locality any thread
+ * @locks rkq MUST BE locked
  */
 static RD_INLINE RD_UNUSED
 int rd_kafka_q_reenq (rd_kafka_q_t *rkq, rd_kafka_op_t *rko) {
-        rd_kafka_q_t *fwdq;
-
-        rd_dassert(rkq->rkq_refcnt > 0);
-
-        if (unlikely(!(rkq->rkq_flags & RD_KAFKA_Q_F_READY)))
-                return rd_kafka_op_reply(rko, RD_KAFKA_RESP_ERR__DESTROY);
-
-        if (!rko->rko_serve && rkq->rkq_serve) {
-                /* Store original queue's serve callback and opaque
-                 * prior to forwarding. */
-                rko->rko_serve = rkq->rkq_serve;
-                rko->rko_serve_opaque = rkq->rkq_opaque;
-        }
-
-        if (!(fwdq = rd_kafka_q_fwd_get(rkq, 0))) {
-                rd_kafka_q_enq0(rkq, rko, 1/*at_head*/);
-                cnd_signal(&rkq->rkq_cond);
-                if (rkq->rkq_qlen == 1)
-                        rd_kafka_q_io_event(rkq);
-        } else {
-                rd_kafka_q_enq(fwdq, rko);
-                rd_kafka_q_destroy(fwdq);
-        }
-
-        return 1;
+        return rd_kafka_q_enq1(rkq, rko, rkq, 1/*at head*/, 0/*don't lock*/);
 }
 
 
@@ -683,7 +696,7 @@ rd_kafka_replyq_enq (rd_kafka_replyq_t *replyq, rd_kafka_op_t *rko,
 
 	/* The replyq queue reference is done after we've enqueued the rko
 	 * so clear it here. */
-	replyq->q = NULL;
+        replyq->q = NULL; /* destroyed separately below */
 
 #if ENABLE_DEVEL
 	if (replyq->_id) {
@@ -759,11 +772,254 @@ void rd_kafka_q_io_event_enable (rd_kafka_q_t *rkq, int fd,
 struct rd_kafka_queue_s {
 	rd_kafka_q_t *rkqu_q;
         rd_kafka_t   *rkqu_rk;
+        int           rkqu_is_owner; /**< Is owner/creator of rkqu_q */
 };
 
 
 void rd_kafka_q_dump (FILE *fp, rd_kafka_q_t *rkq);
 
 extern int RD_TLS rd_kafka_yield_thread;
+
+
+
+/**
+ * @name Enqueue op once
+ * @{
+ */
+
+/**
+ * @brief Minimal rd_kafka_op_t wrapper that ensures that
+ *        the op is only enqueued on the provided queue once.
+ *
+ * Typical use-case is for an op to be triggered from multiple sources,
+ * but at most once, such as from a timer and some other source.
+ */
+typedef struct rd_kafka_enq_once_s {
+        mtx_t lock;
+        int refcnt;
+        rd_kafka_op_t *rko;
+        rd_kafka_replyq_t replyq;
+} rd_kafka_enq_once_t;
+
+
+/**
+ * @brief Allocate and set up a new eonce and set the initial refcount to 1.
+ * @remark This is to be called by the owner of the rko.
+ */
+static RD_INLINE RD_UNUSED
+rd_kafka_enq_once_t *
+rd_kafka_enq_once_new (rd_kafka_op_t *rko, rd_kafka_replyq_t replyq) {
+        rd_kafka_enq_once_t *eonce = rd_calloc(1, sizeof(*eonce));
+        mtx_init(&eonce->lock, mtx_plain);
+        eonce->rko = rko;
+        eonce->replyq = replyq; /* struct copy */
+        eonce->refcnt = 1;
+        return eonce;
+}
+
+/**
+ * @brief Re-enable triggering of a eonce even after it has been triggered
+ *        once.
+ *
+ * @remark This is to be called by the owner.
+ */
+static RD_INLINE RD_UNUSED
+void
+rd_kafka_enq_once_reenable (rd_kafka_enq_once_t *eonce,
+                            rd_kafka_op_t *rko, rd_kafka_replyq_t replyq) {
+        mtx_lock(&eonce->lock);
+        eonce->rko = rko;
+        rd_kafka_replyq_destroy(&eonce->replyq);
+        eonce->replyq = replyq; /* struct copy */
+        mtx_unlock(&eonce->lock);
+}
+
+
+/**
+ * @brief Free eonce and its resources. Must only be called with refcnt==0
+ *        and eonce->lock NOT held.
+ */
+static RD_INLINE RD_UNUSED
+void rd_kafka_enq_once_destroy0 (rd_kafka_enq_once_t *eonce) {
+        /* This must not be called with the rko or replyq still set, which would
+         * indicate that no enqueueing was performed and that the owner
+         * did not clean up, which is a bug. */
+        rd_assert(!eonce->rko);
+        rd_assert(!eonce->replyq.q);
+#if ENABLE_DEVEL
+        rd_assert(!eonce->replyq._id);
+#endif
+        rd_assert(eonce->refcnt == 0);
+
+        mtx_destroy(&eonce->lock);
+        rd_free(eonce);
+}
+
+
+/**
+ * @brief Increment refcount for source (non-owner), such as a timer.
+ *
+ * @param srcdesc a human-readable descriptive string of the source.
+ *                May be used for future debugging.
+ */
+static RD_INLINE RD_UNUSED
+void rd_kafka_enq_once_add_source (rd_kafka_enq_once_t *eonce,
+                                   const char *srcdesc) {
+        mtx_lock(&eonce->lock);
+        eonce->refcnt++;
+        mtx_unlock(&eonce->lock);
+}
+
+
+/**
+ * @brief Decrement refcount for source (non-owner), such as a timer.
+ *
+ * @param srcdesc a human-readable descriptive string of the source.
+ *                May be used for future debugging.
+ *
+ * @remark Must only be called from the owner with the owner
+ *         still holding its own refcount.
+ *         This API is used to undo an add_source() from the
+ *         same code.
+ */
+static RD_INLINE RD_UNUSED
+void rd_kafka_enq_once_del_source (rd_kafka_enq_once_t *eonce,
+                                   const char *srcdesc) {
+        int do_destroy;
+
+        mtx_lock(&eonce->lock);
+        rd_assert(eonce->refcnt > 1);
+        eonce->refcnt--;
+        do_destroy = eonce->refcnt == 0;
+        mtx_unlock(&eonce->lock);
+
+        if (do_destroy) {
+                /* We're the last refcount holder, clean up eonce. */
+                rd_kafka_enq_once_destroy0(eonce);
+        }
+}
+
+/**
+ * @brief Trigger a source's reference where the eonce resides on
+ *        an rd_list_t. This is typically used as a free_cb for
+ *        rd_list_destroy() and the trigger error code is
+ *        always RD_KAFKA_RESP_ERR__DESTROY.
+ */
+void rd_kafka_enq_once_trigger_destroy (void *ptr);
+
+
+/**
+ * @brief Trigger enqueuing of the rko (unless already enqueued)
+ *        and drops the source's refcount.
+ *
+ * @remark Must only be called by sources (non-owner).
+ */
+static RD_INLINE RD_UNUSED
+void rd_kafka_enq_once_trigger (rd_kafka_enq_once_t *eonce,
+                                rd_kafka_resp_err_t err,
+                                const char *srcdesc) {
+        int do_destroy;
+        rd_kafka_op_t *rko = NULL;
+        rd_kafka_replyq_t replyq = RD_ZERO_INIT;
+
+        mtx_lock(&eonce->lock);
+
+        rd_assert(eonce->refcnt > 0);
+        eonce->refcnt--;
+        do_destroy = eonce->refcnt == 0;
+
+        if (eonce->rko) {
+                /* Not already enqueued, do it.
+                 * Detach the rko and replyq from the eonce and unlock the eonce
+                 * before enqueuing rko on reply to avoid recursive locks
+                 * if the replyq has been disabled and the ops
+                 * destructor is called (which might then access the eonce
+                 * to clean up). */
+                rko = eonce->rko;
+                replyq = eonce->replyq;
+
+                eonce->rko = NULL;
+                rd_kafka_replyq_clear(&eonce->replyq);
+
+                /* Reply is enqueued at the end of this function */
+        }
+        mtx_unlock(&eonce->lock);
+
+        if (do_destroy) {
+                /* We're the last refcount holder, clean up eonce. */
+                rd_kafka_enq_once_destroy0(eonce);
+        }
+
+        if (rko) {
+                rd_kafka_replyq_enq(&replyq, rko, replyq.version);
+                rd_kafka_replyq_destroy(&replyq);
+        }
+}
+
+/**
+ * @brief Destroy eonce, must only be called by the owner.
+ *        There may be outstanding refcounts by non-owners after this call
+ */
+static RD_INLINE RD_UNUSED
+void rd_kafka_enq_once_destroy (rd_kafka_enq_once_t *eonce) {
+       int do_destroy;
+
+        mtx_lock(&eonce->lock);
+        rd_assert(eonce->refcnt > 0);
+        eonce->refcnt--;
+        do_destroy = eonce->refcnt == 0;
+
+        eonce->rko = NULL;
+        rd_kafka_replyq_destroy(&eonce->replyq);
+
+        mtx_unlock(&eonce->lock);
+
+        if (do_destroy) {
+                /* We're the last refcount holder, clean up eonce. */
+                rd_kafka_enq_once_destroy0(eonce);
+        }
+}
+
+
+/**
+ * @brief Disable the owner's eonce, extracting, resetting and returning
+ *        the \c rko object.
+ *
+ *        This is the same as rd_kafka_enq_once_destroy() but returning
+ *        the rko.
+ *
+ *        Use this for owner-thread triggering where the enqueuing of the
+ *        rko on the replyq is not necessary.
+ *
+ * @returns the eonce's rko object, if still available, else NULL.
+ */
+static RD_INLINE RD_UNUSED
+rd_kafka_op_t *rd_kafka_enq_once_disable (rd_kafka_enq_once_t *eonce) {
+       int do_destroy;
+       rd_kafka_op_t *rko;
+
+        mtx_lock(&eonce->lock);
+        rd_assert(eonce->refcnt > 0);
+        eonce->refcnt--;
+        do_destroy = eonce->refcnt == 0;
+
+        /* May be NULL */
+        rko = eonce->rko;
+        eonce->rko = NULL;
+        rd_kafka_replyq_destroy(&eonce->replyq);
+
+        mtx_unlock(&eonce->lock);
+
+        if (do_destroy) {
+                /* We're the last refcount holder, clean up eonce. */
+                rd_kafka_enq_once_destroy0(eonce);
+        }
+
+        return rko;
+}
+
+
+/**@}*/
+
 
 #endif /* _RDKAFKA_QUEUE_H_ */

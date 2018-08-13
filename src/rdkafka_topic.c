@@ -117,6 +117,9 @@ void rd_kafka_topic_destroy_final (rd_kafka_itopic_t *rkt) {
         rd_kafka_assert(rkt->rkt_rk, rd_list_empty(&rkt->rkt_desp));
         rd_list_destroy(&rkt->rkt_desp);
 
+        rd_avg_destroy(&rkt->rkt_avg_batchsize);
+        rd_avg_destroy(&rkt->rkt_avg_batchcnt);
+
 	if (rkt->rkt_topic)
 		rd_kafkap_str_destroy(rkt->rkt_topic);
 
@@ -309,6 +312,40 @@ shptr_rd_kafka_itopic_t *rd_kafka_topic_new0 (rd_kafka_t *rk,
 
 	if (rkt->rkt_conf.compression_codec == RD_KAFKA_COMPRESSION_INHERIT)
 		rkt->rkt_conf.compression_codec = rk->rk_conf.compression_codec;
+
+        /* Translate compression level to library-specific level and check
+         * upper bound */
+        switch (rkt->rkt_conf.compression_codec) {
+#if WITH_ZLIB
+        case RD_KAFKA_COMPRESSION_GZIP:
+                if (rkt->rkt_conf.compression_level == RD_KAFKA_COMPLEVEL_DEFAULT)
+                        rkt->rkt_conf.compression_level = Z_DEFAULT_COMPRESSION;
+                else if (rkt->rkt_conf.compression_level > RD_KAFKA_COMPLEVEL_GZIP_MAX)
+                        rkt->rkt_conf.compression_level =
+                                RD_KAFKA_COMPLEVEL_GZIP_MAX;
+                break;
+#endif
+        case RD_KAFKA_COMPRESSION_LZ4:
+                if (rkt->rkt_conf.compression_level == RD_KAFKA_COMPLEVEL_DEFAULT)
+                        /* LZ4 has no notion of system-wide default compression
+                         * level, use zero in this case */
+                        rkt->rkt_conf.compression_level = 0;
+                else if (rkt->rkt_conf.compression_level > RD_KAFKA_COMPLEVEL_LZ4_MAX)
+                        rkt->rkt_conf.compression_level =
+                                RD_KAFKA_COMPLEVEL_LZ4_MAX;
+                break;
+        case RD_KAFKA_COMPRESSION_SNAPPY:
+        default:
+                /* Compression level has no effect in this case */
+                rkt->rkt_conf.compression_level = RD_KAFKA_COMPLEVEL_DEFAULT;
+        }
+	
+        rd_avg_init(&rkt->rkt_avg_batchsize, RD_AVG_GAUGE, 0,
+                    rk->rk_conf.max_msg_size, 2,
+                    rk->rk_conf.stats_interval_ms ? 1 : 0);
+        rd_avg_init(&rkt->rkt_avg_batchcnt, RD_AVG_GAUGE, 0,
+                    rk->rk_conf.batch_num_messages, 2,
+                    rk->rk_conf.stats_interval_ms ? 1 : 0);
 
 	rd_kafka_dbg(rk, TOPIC, "TOPIC", "New local topic: %.*s",
 		     RD_KAFKAP_STR_PR(rkt->rkt_topic));
@@ -736,7 +773,7 @@ static void rd_kafka_topic_assign_uas (rd_kafka_itopic_t *rkt,
 void rd_kafka_topic_metadata_none (rd_kafka_itopic_t *rkt) {
 	rd_kafka_topic_wrlock(rkt);
 
-	if (unlikely(rd_atomic32_get(&rkt->rkt_rk->rk_terminate))) {
+	if (unlikely(rd_kafka_terminating(rkt->rkt_rk))) {
 		/* Dont update metadata while terminating, do this
 		 * after acquiring lock for proper synchronisation */
 		rd_kafka_topic_wrunlock(rkt);
@@ -818,9 +855,9 @@ rd_kafka_topic_metadata_update (rd_kafka_itopic_t *rkt,
         old_state = rkt->rkt_state;
 	rkt->rkt_ts_metadata = ts_age;
 
-	/* Set topic state */
+	/* Set topic state.
+         * UNKNOWN_TOPIC_OR_PART may indicate that auto.create.topics failed */
 	if (mdt->err == RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART ||
-	    mdt->err == RD_KAFKA_RESP_ERR_UNKNOWN/*auto.create.topics fails*/||
             mdt->err == RD_KAFKA_RESP_ERR_TOPIC_EXCEPTION/*invalid topic*/)
                 rd_kafka_topic_set_state(rkt, RD_KAFKA_TOPIC_S_NOTEXISTS);
         else if (mdt->partition_cnt > 0)

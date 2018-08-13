@@ -53,7 +53,7 @@ def test_it (version, deploy=True, conf={}, rdkconf={}, tests=None,
     else:
         rdkafka.start()
         print('# librdkafka regression tests started, logs in %s' % rdkafka.root_path())
-        rdkafka.wait_stopped(timeout=60*10)
+        rdkafka.wait_stopped(timeout=60*30)
 
         report = rdkafka.report()
         report['root_path'] = rdkafka.root_path()
@@ -199,6 +199,10 @@ if __name__ == '__main__':
                 print('\033[41m#### Version %s, suite %s: FAILED: %s\033[0m' %
                       (version, suite['name'], reason))
                 fail_cnt += 1
+
+                # Emit hopefully relevant parts of the log on failure
+                subprocess.call("grep --color=always -B100 -A10 FAIL %s" % (os.path.join(report['root_path'], 'stderr.log')), shell=True)
+
             print('#### Test output: %s/stderr.log' % (report['root_path']))
 
             suite['version'][version] = report

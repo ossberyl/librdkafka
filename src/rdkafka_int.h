@@ -101,9 +101,9 @@ typedef RD_SHARED_PTR_TYPE(, struct rd_kafka_itopic_s) shptr_rd_kafka_itopic_t;
 /**
  * Protocol level sanity
  */
-#define RD_KAFKAP_BROKERS_MAX     1000
+#define RD_KAFKAP_BROKERS_MAX     10000
 #define RD_KAFKAP_TOPICS_MAX      1000000
-#define RD_KAFKAP_PARTITIONS_MAX  10000
+#define RD_KAFKAP_PARTITIONS_MAX  100000
 
 
 #define RD_KAFKA_OFFSET_IS_LOGICAL(OFF)  ((OFF) < 0)
@@ -136,7 +136,9 @@ struct rd_kafka_s {
 	cnd_t                      rk_broker_state_change_cnd;
 	mtx_t                      rk_broker_state_change_lock;
 	int                        rk_broker_state_change_version;
-
+        /* List of (rd_kafka_enq_once_t*) objects waiting for broker
+         * state changes. Protected by rk_broker_state_change_lock. */
+        rd_list_t rk_broker_state_change_waiters; /**< (rd_kafka_enq_once_t*) */
 
 	TAILQ_HEAD(, rd_kafka_itopic_s)  rk_topics;
 	int              rk_topic_cnt;
@@ -150,7 +152,39 @@ struct rd_kafka_s {
         rd_kafkap_str_t *rk_group_id;    /* Consumer group id */
 
 	int              rk_flags;
-	rd_atomic32_t    rk_terminate;
+	rd_atomic32_t    rk_terminate;   /**< Set to RD_KAFKA_DESTROY_F_..
+                                          *   flags instance
+                                          *   is being destroyed.
+                                          *   The value set is the
+                                          *   destroy flags from
+                                          *   rd_kafka_destroy*() and
+                                          *   the two internal flags shown
+                                          *   below.
+                                          *
+                                          * Order:
+                                          * 1. user_flags | .._F_DESTROY_CALLED
+                                          *    is set in rd_kafka_destroy*().
+                                          * 2. consumer_close() is called
+                                          *    for consumers.
+                                          * 3. .._F_TERMINATE is set to
+                                          *    signal all background threads
+                                          *    to terminate.
+                                          */
+
+#define RD_KAFKA_DESTROY_F_TERMINATE 0x1 /**< Internal flag to make sure
+                                          *   rk_terminate is set to non-zero
+                                          *   value even if user passed
+                                          *   no destroy flags. */
+#define RD_KAFKA_DESTROY_F_DESTROY_CALLED 0x2 /**< Application has called
+                                               *  ..destroy*() and we've
+                                               * begun the termination
+                                               * process.
+                                               * This flag is needed to avoid
+                                               * rk_terminate from being
+                                               * 0 when destroy_flags()
+                                               * is called with flags=0
+                                               * and prior to _F_TERMINATE
+                                               * has been set. */
 	rwlock_t         rk_lock;
 	rd_kafka_type_t  rk_type;
 	struct timeval   rk_tv_state_change;
@@ -167,6 +201,7 @@ struct rd_kafka_s {
         struct rd_kafka_metadata_cache rk_metadata_cache; /* Metadata cache */
 
         char            *rk_clusterid;      /* ClusterId from metadata */
+        int32_t          rk_controllerid;   /* ControllerId from metadata */
 
         /* Simple consumer count:
          *  >0: Running in legacy / Simple Consumer mode,
@@ -198,6 +233,20 @@ struct rd_kafka_s {
 	thrd_t rk_thread;
 
         int rk_initialized;
+
+        /**
+         * Background thread and queue,
+         * enabled by setting `background_event_cb()`.
+         */
+        struct {
+                rd_kafka_q_t *q;  /**< Queue served by background thread. */
+                thrd_t thread;    /**< Background thread. */
+                int calling;      /**< Indicates whether the event callback
+                                   *   is being called, reset back to 0
+                                   *   when the callback returns.
+                                   *   This can be used for troubleshooting
+                                   *   purposes. */
+        } rk_background;
 };
 
 #define rd_kafka_wrlock(rk)    rwlock_wrlock(&(rk)->rk_lock)
@@ -320,9 +369,29 @@ void rd_kafka_destroy_final (rd_kafka_t *rk);
 
 
 /**
- * Returns true if 'rk' handle is terminating.
+ * @returns true if \p rk handle is terminating.
+ *
+ * @remark If consumer_close() is called from destroy*() it will be
+ *         called prior to _F_TERMINATE being set and will thus not
+ *         be able to use rd_kafka_terminating() to know it is shutting down.
+ *         That code should instead just check that rk_terminate is non-zero
+ *         (the _F_DESTROY_CALLED flag will be set).
  */
-#define rd_kafka_terminating(rk) (rd_atomic32_get(&(rk)->rk_terminate))
+#define rd_kafka_terminating(rk) (rd_atomic32_get(&(rk)->rk_terminate) & \
+                                  RD_KAFKA_DESTROY_F_TERMINATE)
+
+/**
+ * @returns the destroy flags set matching \p flags, which might be
+ *          a subset of the flags.
+ */
+#define rd_kafka_destroy_flags_check(rk,flags) \
+        (rd_atomic32_get(&(rk)->rk_terminate) & (flags))
+
+/**
+ * @returns true if no consumer callbacks, or standard consumer_close
+ *          behaviour, should be triggered. */
+#define rd_kafka_destroy_flags_no_consumer_close(rk) \
+        rd_kafka_destroy_flags_check(rk, RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE)
 
 #define rd_kafka_is_simple_consumer(rk) \
         (rd_atomic32_get(&(rk)->rk_simple_cnt) > 0)
@@ -362,6 +431,7 @@ int rd_kafka_simple_consumer_add (rd_kafka_t *rk);
 #define RD_KAFKA_DBG_INTERCEPTOR    0x800
 #define RD_KAFKA_DBG_PLUGIN         0x1000
 #define RD_KAFKA_DBG_CONSUMER       0x2000
+#define RD_KAFKA_DBG_ADMIN          0x4000
 #define RD_KAFKA_DBG_ALL            0xffff
 #define RD_KAFKA_DBG_NONE           0x0
 
@@ -413,17 +483,14 @@ static RD_UNUSED RD_INLINE
 rd_kafka_resp_err_t rd_kafka_set_last_error (rd_kafka_resp_err_t err,
 					     int errnox) {
         if (errnox) {
-#ifdef _MSC_VER
-                /* This is the correct way to set errno on Windows,
+                /* MSVC:
+                 * This is the correct way to set errno on Windows,
                  * but it is still pointless due to different errnos in
                  * in different runtimes:
                  * https://social.msdn.microsoft.com/Forums/vstudio/en-US/b4500c0d-1b69-40c7-9ef5-08da1025b5bf/setting-errno-from-within-a-dll?forum=vclanguage/
                  * errno is thus highly deprecated, and buggy, on Windows
                  * when using librdkafka as a dynamically loaded DLL. */
-                _set_errno(errnox);
-#else
-                errno = errnox;
-#endif
+                rd_set_errno(errnox);
         }
 	rd_kafka_last_error_code = err;
 	return err;
@@ -442,5 +509,12 @@ rd_kafka_poll_cb (rd_kafka_t *rk, rd_kafka_q_t *rkq, rd_kafka_op_t *rko,
                   rd_kafka_q_cb_type_t cb_type, void *opaque);
 
 rd_kafka_resp_err_t rd_kafka_subscribe_rkt (rd_kafka_itopic_t *rkt);
+
+
+
+/**
+ * rdkafka_background.c
+ */
+int rd_kafka_background_thread_main (void *arg);
 
 #endif /* _RDKAFKA_INT_H_ */

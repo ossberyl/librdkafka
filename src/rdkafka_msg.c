@@ -671,7 +671,7 @@ rd_kafka_msg_partitioner_murmur2 (const rd_kafka_topic_t *rkt,
                                   int32_t partition_cnt,
                                   void *rkt_opaque,
                                   void *msg_opaque) {
-        return rd_murmur2(key, keylen) % partition_cnt;
+        return (rd_murmur2(key, keylen) & 0x7fffffff) % partition_cnt;
 }
 
 int32_t rd_kafka_msg_partitioner_murmur2_random (const rd_kafka_topic_t *rkt,
@@ -687,7 +687,7 @@ int32_t rd_kafka_msg_partitioner_murmur2_random (const rd_kafka_topic_t *rkt,
                                                        rkt_opaque,
                                                        msg_opaque);
         else
-                return rd_murmur2(key, keylen) % partition_cnt;
+                return (rd_murmur2(key, keylen) & 0x7fffffff) % partition_cnt;
 }
 
 
@@ -785,7 +785,7 @@ int rd_kafka_msg_partitioner (rd_kafka_itopic_t *rkt, rd_kafka_msg_t *rkm,
 	}
 
         rktp_new = rd_kafka_toppar_s2i(s_rktp_new);
-        rd_atomic64_add(&rktp_new->rktp_c.msgs, 1);
+        rd_atomic64_add(&rktp_new->rktp_c.producer_enq_msgs, 1);
 
         /* Update message partition */
         if (rkm->rkm_partition == RD_KAFKA_PARTITION_UA)
@@ -905,6 +905,8 @@ rd_kafka_message_t *rd_kafka_message_get (rd_kafka_op_t *rko) {
         case RD_KAFKA_OP_CONSUMER_ERR:
                 rkmessage = &rko->rko_u.err.rkm.rkm_rkmessage;
                 rkmessage->payload = rko->rko_u.err.errstr;
+                rkmessage->len = rkmessage->payload ?
+                        strlen(rkmessage->payload) : 0;
                 rkmessage->offset  = rko->rko_u.err.offset;
                 break;
 

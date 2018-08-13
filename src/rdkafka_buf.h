@@ -301,7 +301,7 @@ rd_tmpabuf_write_str0 (const char *func, int line,
 #define rd_kafka_buf_read_i16(rkbuf,dstptr) do {                        \
                 int16_t _v;                                             \
                 rd_kafka_buf_read(rkbuf, &_v, sizeof(_v));              \
-                *(dstptr) = be16toh(_v);                                \
+                *(dstptr) = (int16_t)be16toh(_v);                       \
         } while (0)
 
 
@@ -314,6 +314,13 @@ rd_tmpabuf_write_str0 (const char *func, int line,
 #define rd_kafka_buf_read_i8(rkbuf, dst) rd_kafka_buf_read(rkbuf, dst, 1)
 
 #define rd_kafka_buf_peek_i8(rkbuf,of,dst) rd_kafka_buf_peek(rkbuf,of,dst,1)
+
+#define rd_kafka_buf_read_bool(rkbuf, dstptr) do {                      \
+                int8_t _v;                                              \
+                rd_bool_t *_dst = dstptr;                               \
+                rd_kafka_buf_read(rkbuf, &_v, 1);                       \
+                *_dst = (rd_bool_t)_v;                                  \
+        } while (0)
 
 
 /**
@@ -334,7 +341,7 @@ rd_tmpabuf_write_str0 (const char *func, int line,
                 int _klen;                                              \
                 rd_kafka_buf_read_i16a(rkbuf, (kstr)->len);             \
                 _klen = RD_KAFKAP_STR_LEN(kstr);                        \
-                if (RD_KAFKAP_STR_LEN0(_klen) == 0)                     \
+                if (RD_KAFKAP_STR_IS_NULL(kstr))                        \
                         (kstr)->str = NULL;                             \
                 else if (!((kstr)->str =                                \
                            rd_slice_ensure_contig(&rkbuf->rkbuf_reader, \
@@ -464,7 +471,12 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 	struct rd_kafkap_reqhdr rkbuf_reqhdr;   /* Request header.
                                                  * These fields are encoded
                                                  * and written to output buffer
-                                                 * on buffer finalization. */
+                                                 * on buffer finalization.
+                                                 * Note:
+                                                 * The request's
+                                                 * reqhdr is copied to the
+                                                 * response's reqhdr as a
+                                                 * convenience. */
 	struct rd_kafkap_reshdr rkbuf_reshdr;   /* Response header.
                                                  * Decoded fields are copied
                                                  * here from the buffer
@@ -575,6 +587,12 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
                                              *   depends on request type. */
 };
 
+
+/**
+ * @returns true if buffer has been sent on wire, else 0.
+ */
+#define rd_kafka_buf_was_sent(rkbuf)                    \
+        ((rkbuf)->rkbuf_flags & RD_KAFKA_OP_F_SENT)
 
 typedef struct rd_kafka_bufq_s {
 	TAILQ_HEAD(, rd_kafka_buf_s) rkbq_bufs;

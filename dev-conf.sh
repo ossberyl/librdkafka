@@ -9,10 +9,15 @@ set -e
 #export CFLAGS='-std=c99 -pedantic -Wshadow'
 #export CXXFLAGS='-std=c++98 -pedantic'
 
-# enable FSAN
+# enable FSAN address, thread, ..
 #FSAN="-fsanitize=address"
-#export CPPFLAGS="$CPPFLAGS $FSAN"
-#export LDFLAGS="$LDFLAGS $FSAN"
+#FSAN="-fsanitize=thread"
+#FSAN="-fsanitize=undefined -fsanitize-undefined-trap-on-error -fno-omit-frame-pointer"
+
+if [[ ! -z $FSAN ]]; then
+    export CPPFLAGS="$CPPFLAGS $FSAN"
+    export LDFLAGS="$LDFLAGS $FSAN"
+fi
 
 OPTS=""
 
