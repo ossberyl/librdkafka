@@ -65,6 +65,7 @@ static const char *test_git_version = "HEAD";
 static const char *test_sockem_conf = "";
 int          test_on_ci = 0; /* Tests are being run on CI, be more forgiving
                               * with regards to timeouts, etc. */
+static int test_idempotent_producer = 0;
 static int show_summary = 1;
 static int test_summary (int do_lock);
 
@@ -72,6 +73,7 @@ static int test_summary (int do_lock);
  * Protects shared state, such as tests[]
  */
 mtx_t test_mtx;
+cnd_t test_cnd;
 
 static const char *test_states[] = {
         "DNS",
@@ -175,6 +177,10 @@ _TEST_DECL(0082_fetch_max_bytes);
 _TEST_DECL(0083_cb_event);
 _TEST_DECL(0084_destroy_flags_local);
 _TEST_DECL(0084_destroy_flags);
+_TEST_DECL(0086_purge_local);
+_TEST_DECL(0086_purge_remote);
+_TEST_DECL(0088_produce_metadata_timeout);
+_TEST_DECL(0089_max_poll_interval);
 
 /* Manual tests */
 _TEST_DECL(8000_idle);
@@ -283,6 +289,13 @@ struct test tests[] = {
         _TEST(0083_cb_event, 0, TEST_BRKVER(0,9,0,0)),
         _TEST(0084_destroy_flags_local, TEST_F_LOCAL),
         _TEST(0084_destroy_flags, 0),
+        _TEST(0086_purge_local, TEST_F_LOCAL),
+        _TEST(0086_purge_remote, 0),
+#if WITH_SOCKEM
+        _TEST(0088_produce_metadata_timeout, TEST_F_SOCKEM),
+#endif
+        _TEST(0089_max_poll_interval, 0, TEST_BRKVER(0,10,1,0)),
+
         /* Manual tests */
         _TEST(8000_idle, TEST_F_MANUAL),
 
@@ -333,6 +346,16 @@ int test_socket_sockem_set_all (const char *key, int val) {
         TEST_UNLOCK();
 
         return cnt;
+}
+
+void test_socket_sockem_set (int s, const char *key, int value) {
+        sockem_t *skm;
+
+        TEST_LOCK();
+        skm = sockem_find(s);
+        if (skm)
+                sockem_set(skm, key, value, NULL);
+        TEST_UNLOCK();
 }
 
 void test_socket_close_all (struct test *test, int reinit) {
@@ -397,12 +420,30 @@ void test_socket_enable (rd_kafka_conf_t *conf) {
 
 static void test_error_cb (rd_kafka_t *rk, int err,
 			   const char *reason, void *opaque) {
-        if (test_curr->is_fatal_cb && !test_curr->is_fatal_cb(rk, err, reason))
-                TEST_SAY(_C_YEL "rdkafka error (non-fatal): %s: %s\n",
+        if (test_curr->is_fatal_cb && !test_curr->is_fatal_cb(rk, err, reason)) {
+                TEST_SAY(_C_YEL "rdkafka error (non-testfatal): %s: %s\n",
                          rd_kafka_err2str(err), reason);
-        else
-                TEST_FAIL("rdkafka error: %s: %s",
-                          rd_kafka_err2str(err), reason);
+        } else {
+                if (err == RD_KAFKA_RESP_ERR__FATAL) {
+                        char errstr[512];
+                        TEST_SAY(_C_RED "Fatal error: %s\n", reason);
+
+                        err = rd_kafka_fatal_error(rk, errstr, sizeof(errstr));
+
+                        if (test_curr->is_fatal_cb &&
+                            !test_curr->is_fatal_cb(rk,  err, reason))
+                                TEST_SAY(_C_YEL "rdkafka ignored FATAL error: "
+                                         "%s: %s\n",
+                                         rd_kafka_err2str(err), errstr);
+                        else
+                                TEST_FAIL("rdkafka FATAL error: %s: %s",
+                                          rd_kafka_err2str(err), errstr);
+
+                } else {
+                        TEST_FAIL("rdkafka error: %s: %s",
+                                  rd_kafka_err2str(err), reason);
+                }
+        }
 }
 
 static int test_stats_cb (rd_kafka_t *rk, char *json, size_t json_len,
@@ -663,6 +704,8 @@ void test_conf_init (rd_kafka_conf_t **conf, rd_kafka_topic_conf_t **topic_conf,
         if (conf) {
                 *conf = rd_kafka_conf_new();
                 rd_kafka_conf_set(*conf, "client.id", test_curr->name, NULL, 0);
+                test_conf_set(*conf, "enable.idempotence",
+                              test_idempotent_producer ? "true" : "false");
                 rd_kafka_conf_set_error_cb(*conf, test_error_cb);
                 rd_kafka_conf_set_stats_cb(*conf, test_stats_cb);
 
@@ -857,6 +900,8 @@ static int run_test0 (struct run_args *run_args) {
 #if WITH_SOCKEM
         rd_list_init(&test->sockets, 16, (void *)sockem_close);
 #endif
+        /* Don't check message status by default */
+        test->exp_dr_status = (rd_kafka_msg_status_t)-1;
 
 	TEST_SAY("================= Running test %s =================\n",
 		 test->name);
@@ -888,6 +933,8 @@ static int run_test0 (struct run_args *run_args) {
                          run_args->test->name);
         }
         TEST_UNLOCK();
+
+        cnd_broadcast(&test_cnd);
 
 #if WITH_SOCKEM
         test_socket_close_all(test, 0);
@@ -944,14 +991,12 @@ static int run_test (struct test *test, int argc, char **argv) {
 
         TEST_LOCK();
         while (tests_running_cnt >= test_concurrent_max) {
-                if (!(wait_cnt++ % 10))
+                if (!(wait_cnt++ % 100))
                         TEST_SAY("Too many tests running (%d >= %d): "
                                  "postponing %s start...\n",
                                  tests_running_cnt, test_concurrent_max,
                                  test->name);
-                TEST_UNLOCK();
-                rd_sleep(1);
-                TEST_LOCK();
+                cnd_timedwait_ms(&test_cnd, &test_mtx, 100);
         }
         tests_running_cnt++;
         test->timeout = test_clock() + (int64_t)(20.0 * 1000000.0 *
@@ -1273,6 +1318,7 @@ int main(int argc, char **argv) {
 	int a,b,c,d;
 
 	mtx_init(&test_mtx, mtx_plain);
+        cnd_init(&test_cnd);
 
         test_init();
 
@@ -1311,6 +1357,8 @@ int main(int argc, char **argv) {
 			show_summary = 0;
                 else if (!strcmp(argv[i], "-D"))
                         test_delete_topics_between = 1;
+                else if (!strcmp(argv[i], "-P"))
+                        test_idempotent_producer = 1;
 		else if (*argv[i] != '-')
                         tests_to_run = argv[i];
                 else {
@@ -1326,6 +1374,7 @@ int main(int argc, char **argv) {
 			       "  -S     Dont show test summary\n"
 			       "  -V <N.N.N.N> Broker version.\n"
                                "  -D     Delete all test topics between each test (-p1) or after all tests\n"
+                               "  -P     Run all tests with `enable.idempotency=true`\n"
 			       "\n"
 			       "Environment variables:\n"
 			       "  TESTS - substring matched test to run (e.g., 0033)\n"
@@ -1405,6 +1454,8 @@ int main(int argc, char **argv) {
         TEST_SAY("Test timeout multiplier: %.1f\n", test_timeout_multiplier);
         TEST_SAY("Action on test failure: %s\n",
                  test_assert_on_fail ? "assert crash" : "continue other tests");
+        if (test_idempotent_producer)
+                TEST_SAY("Test Idempotent Producer: enabled\n");
 
         {
                 char cwd[512], *pcwd;
@@ -1507,16 +1558,35 @@ int main(int argc, char **argv) {
  *
  ******************************************************************************/
 
-void test_dr_cb (rd_kafka_t *rk, void *payload, size_t len,
-                 rd_kafka_resp_err_t err, void *opaque, void *msg_opaque) {
-	int *remainsp = msg_opaque;
+void test_dr_msg_cb (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage,
+                     void *opaque) {
+        int *remainsp = rkmessage->_private;
+        static const char *status_names[] = {
+                [RD_KAFKA_MSG_STATUS_NOT_PERSISTED] = "NotPersisted",
+                [RD_KAFKA_MSG_STATUS_POSSIBLY_PERSISTED] = "PossiblyPersisted",
+                [RD_KAFKA_MSG_STATUS_PERSISTED] = "Persisted"
+        };
 
-        TEST_SAYL(4, "Delivery report: %s\n", rd_kafka_err2str(err));
+        TEST_SAYL(4, "Delivery report: %s (%s)\n",
+                  rd_kafka_err2str(rkmessage->err),
+                  status_names[rd_kafka_message_status(rkmessage)]);
 
-        if (!test_curr->produce_sync && err != test_curr->exp_dr_err)
-                TEST_FAIL("Message delivery failed: expected %s, got %s",
-                          rd_kafka_err2str(test_curr->exp_dr_err),
-                          rd_kafka_err2str(err));
+        if (!test_curr->produce_sync) {
+                if (rkmessage->err != test_curr->exp_dr_err)
+                        TEST_FAIL("Message delivery failed: expected %s, got %s",
+                                  rd_kafka_err2str(test_curr->exp_dr_err),
+                                  rd_kafka_err2str(rkmessage->err));
+
+                if ((int)test_curr->exp_dr_status != -1) {
+                        rd_kafka_msg_status_t status =
+                                rd_kafka_message_status(rkmessage);
+
+                        TEST_ASSERT(status == test_curr->exp_dr_status,
+                                    "Expected message status %s, not %s",
+                                    status_names[test_curr->exp_dr_status],
+                                    status_names[status]);
+                }
+        }
 
 	if (*remainsp == 0)
 		TEST_FAIL("Too many messages delivered (remains %i)",
@@ -1525,7 +1595,7 @@ void test_dr_cb (rd_kafka_t *rk, void *payload, size_t len,
 	(*remainsp)--;
 
         if (test_curr->produce_sync)
-                test_curr->produce_sync_err = err;
+                test_curr->produce_sync_err = rkmessage->err;
 }
 
 
@@ -1560,7 +1630,7 @@ rd_kafka_t *test_create_producer (void) {
 	rd_kafka_conf_t *conf;
 
 	test_conf_init(&conf, NULL, 0);
-	rd_kafka_conf_set_dr_cb(conf, test_dr_cb);
+        rd_kafka_conf_set_dr_msg_cb(conf, test_dr_msg_cb);
 
 	return test_create_handle(RD_KAFKA_PRODUCER, conf);
 }
@@ -1636,7 +1706,7 @@ rd_kafka_topic_t *test_create_producer_topic (rd_kafka_t *rk,
  * Produces \p cnt messages and returns immediately.
  * Does not wait for delivery.
  * \p msgcounterp is incremented for each produced messages and passed
- * as \p msg_opaque which is later used in test_dr_cb to decrement
+ * as \p msg_opaque which is later used in test_dr_msg_cb to decrement
  * the counter on delivery.
  *
  * If \p payload is NULL the message key and payload will be formatted
@@ -3166,9 +3236,10 @@ void test_flush (rd_kafka_t *rk, int timeout_ms) {
 	err = rd_kafka_flush(rk, timeout_ms);
 	TIMING_STOP(&timing);
 	if (err)
-		TEST_FAIL("Failed to flush(%s, %d): %s\n",
+		TEST_FAIL("Failed to flush(%s, %d): %s: len() = %d\n",
 			  rd_kafka_name(rk), timeout_ms,
-			  rd_kafka_err2str(err));
+			  rd_kafka_err2str(err),
+                          rd_kafka_outq_len(rk));
 }
 
 
@@ -3404,10 +3475,12 @@ void test_create_topic (const char *topicname, int partition_cnt,
 }
 
 
-int test_get_partition_count (rd_kafka_t *rk, const char *topicname) {
+int test_get_partition_count (rd_kafka_t *rk, const char *topicname,
+                              int timeout_ms) {
         rd_kafka_t *use_rk;
         rd_kafka_resp_err_t err;
         rd_kafka_topic_t *rkt;
+        int64_t abs_timeout = test_clock() + (timeout_ms * 1000);
 
         if (!rk)
                 use_rk = test_create_producer();
@@ -3444,7 +3517,7 @@ int test_get_partition_count (rd_kafka_t *rk, const char *topicname) {
                         rd_kafka_metadata_destroy(metadata);
                         rd_sleep(1);
                 }
-        } while (1);
+        } while (test_clock() < abs_timeout);
 
         rd_kafka_topic_destroy(rkt);
 
@@ -3458,10 +3531,12 @@ int test_get_partition_count (rd_kafka_t *rk, const char *topicname) {
  * @brief Let the broker auto-create the topic for us.
  */
 rd_kafka_resp_err_t test_auto_create_topic_rkt (rd_kafka_t *rk,
-                                                rd_kafka_topic_t *rkt) {
+                                                rd_kafka_topic_t *rkt,
+                                                int timeout_ms) {
 	const struct rd_kafka_metadata *metadata;
 	rd_kafka_resp_err_t err;
 	test_timing_t t;
+        int64_t abs_timeout = test_clock() + (timeout_ms * 1000);
 
         do {
                 TIMING_START(&t, "auto_create_topic");
@@ -3488,17 +3563,18 @@ rd_kafka_resp_err_t test_auto_create_topic_rkt (rd_kafka_t *rk,
                         rd_kafka_metadata_destroy(metadata);
                         rd_sleep(1);
                 }
-        } while (1);
+        } while (test_clock() < abs_timeout);
 
         return err;
 }
 
-rd_kafka_resp_err_t test_auto_create_topic (rd_kafka_t *rk, const char *name) {
+rd_kafka_resp_err_t test_auto_create_topic (rd_kafka_t *rk, const char *name,
+                                            int timeout_ms) {
         rd_kafka_topic_t *rkt = rd_kafka_topic_new(rk, name, NULL);
         rd_kafka_resp_err_t err;
         if (!rkt)
                 return rd_kafka_last_error();
-        err = test_auto_create_topic_rkt(rk, rkt);
+        err = test_auto_create_topic_rkt(rk, rkt, timeout_ms);
         rd_kafka_topic_destroy(rkt);
         return err;
 }
@@ -3516,7 +3592,7 @@ int test_check_auto_create_topic (void) {
 
         test_conf_init(&conf, NULL, 0);
         rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
-        err = test_auto_create_topic(rk, topic);
+        err = test_auto_create_topic(rk, topic, tmout_multip(5000));
         if (err)
                 TEST_SAY("Auto topic creation of \"%s\" failed: %s\n",
                          topic, rd_kafka_err2str(err));

@@ -74,6 +74,12 @@ static void dr_msg_cb (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage,
                                 "got: %s",
                                 rd_kafka_err2str(rkmessage->err));
         else {
+                TEST_ASSERT_LATER(rd_kafka_message_status(rkmessage) ==
+                                  RD_KAFKA_MSG_STATUS_POSSIBLY_PERSISTED,
+                                  "Message should have status "
+                                  "PossiblyPersisted (%d), not %d",
+                                  RD_KAFKA_MSG_STATUS_POSSIBLY_PERSISTED,
+                                  rd_kafka_message_status(rkmessage));
                 msg_dr_fail_cnt++;
         }
 }
@@ -103,7 +109,7 @@ int main_0068_produce_timeout (int argc, char **argv) {
                                          "message.timeout.ms", "100", NULL);
 
         TEST_SAY("Auto-creating topic %s\n", topic);
-        test_auto_create_topic_rkt(rk, rkt);
+        test_auto_create_topic_rkt(rk, rkt, tmout_multip(5000));
 
         TEST_SAY("Producing %d messages that should timeout\n", msgcnt);
         test_produce_msgs_nowait(rk, rkt, testid, 0, 0, msgcnt,
