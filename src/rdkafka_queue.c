@@ -389,8 +389,8 @@ rd_kafka_op_t *rd_kafka_q_pop_serve (rd_kafka_q_t *rkq, int timeout_ms,
 
                         if (cnd_timedwait_abs(&rkq->rkq_cond,
                                               &rkq->rkq_lock,
-                                              &timeout_tspec) ==
-                            thrd_timedout) {
+                                              &timeout_tspec) !=
+                            thrd_success) {
 				mtx_unlock(&rkq->rkq_lock);
 				return NULL;
 			}
@@ -526,6 +526,8 @@ int rd_kafka_q_serve_rkmessages (rd_kafka_q_t *rkq, int timeout_ms,
         rd_kafka_q_t *fwdq;
         struct timespec timeout_tspec;
 
+        rd_kafka_app_polled(rk);
+
 	mtx_lock(&rkq->rkq_lock);
         if ((fwdq = rd_kafka_q_fwd_get(rkq, 0))) {
                 /* Since the q_pop may block we need to release the parent
@@ -549,7 +551,7 @@ int rd_kafka_q_serve_rkmessages (rd_kafka_q_t *rkq, int timeout_ms,
                 while (!(rko = TAILQ_FIRST(&rkq->rkq_q)) &&
                        !rd_kafka_q_check_yield(rkq) &&
                        cnd_timedwait_abs(&rkq->rkq_cond, &rkq->rkq_lock,
-                                         &timeout_tspec) != thrd_timedout)
+                                         &timeout_tspec) == thrd_success)
                         ;
 
 		if (!rko) {

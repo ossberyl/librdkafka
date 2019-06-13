@@ -158,10 +158,7 @@ static void do_offset_test (const char *what, int auto_commit, int auto_store,
 
 		if (rkm->err == RD_KAFKA_RESP_ERR__TIMED_OUT)
 			TEST_FAIL("%s: Timed out waiting for message %d", what,cnt);
-		else if (rkm->err == RD_KAFKA_RESP_ERR__PARTITION_EOF) {
-			rd_kafka_message_destroy(rkm);
-			continue;
-		} else if (rkm->err)
+                else if (rkm->err)
 			TEST_FAIL("%s: Consumer error: %s",
 				  what, rd_kafka_message_errstr(rkm));
 
@@ -264,8 +261,9 @@ static void do_offset_test (const char *what, int auto_commit, int auto_store,
                 rd_kafka_topic_partition_list_add(parts, topic, partition);
                 err = rd_kafka_committed(rk, parts, 1);
                 rd_kafka_topic_partition_list_destroy(parts);
-                TEST_SAY("Issue #827: committed() returned %s\n",
-                         rd_kafka_err2str(err));
+                if (err)
+                        TEST_SAY("Issue #827: committed() returned %s\n",
+                                 rd_kafka_err2str(err));
         } while (err != RD_KAFKA_RESP_ERR__TIMED_OUT);
 
 	/* Query position */
@@ -306,10 +304,7 @@ static void do_offset_test (const char *what, int auto_commit, int auto_store,
 
 		if (rkm->err == RD_KAFKA_RESP_ERR__TIMED_OUT)
 			TEST_FAIL("%s: Timed out waiting for message %d", what,cnt);
-		else if (rkm->err == RD_KAFKA_RESP_ERR__PARTITION_EOF) {
-			rd_kafka_message_destroy(rkm);
-			continue;
-		} else if (rkm->err)
+                else if (rkm->err)
 			TEST_FAIL("%s: Consumer error: %s",
 				  what, rd_kafka_message_errstr(rkm));
 

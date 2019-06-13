@@ -82,6 +82,8 @@ Field | Type | Example | Description
 ----- | ---- | ------- | -----------
 name | string | `"example.com:9092/13"` | Broker hostname, port and broker id
 nodeid | int | 13 | Broker id (-1 for bootstraps)
+nodename | string | `"example.com:9092"` | Broker hostname
+source | string | `"configured"` | Broker source (learned, configured, internal, logical)
 state | string | `"UP"` | Broker state (INIT, DOWN, CONNECT, AUTH, APIVERSION_QUERY, AUTH_HANDSHAKE, UP, UPDATE)
 stateage | int gauge | | Time since last broker state change (microseconds)
 outbuf_cnt | int gauge | | Number of requests awaiting transmission to broker
@@ -98,6 +100,7 @@ rxbytes | int | | Total number of bytes received
 rxerrs | int | | Total number of receive errors
 rxcorriderrs | int | | Total number of unmatched correlation ids in response (typically for timed out requests)
 rxpartial | int | | Total number of partial MessageSets received. The broker may return partial responses if the full MessageSet could not fit in remaining Fetch response size.
+req | object | | Request type counters. Object key is the request name, value is the number of requests sent.
 zbuf_grow | int | | Total number of decompression buffer size increases
 buf_grow | int | | Total number of buffer size increases (deprecated, unused)
 wakeups | int | | Broker thread poll wakeups
@@ -183,17 +186,21 @@ rxbytes | int | | Total number of bytes received for rxmsgs
 msgs | int | | Total number of messages received (consumer, same as rxmsgs), or total number of messages produced (possibly not yet transmitted) (producer).
 rx_ver_drops | int | | Dropped outdated messages
 msgs_inflight | int gauge | | Current number of messages in-flight to/from broker
-next_ack_seq int gauge | | Next expected acked sequence (idempotent producer)
-next_err_seq int gauge | | Next expected errored sequence (idempotent producer)
+next_ack_seq | int gauge | | Next expected acked sequence (idempotent producer)
+next_err_seq | int gauge | | Next expected errored sequence (idempotent producer)
+acked_msgid | int | | Last acked internal message id (idempotent producer)
 
 ## cgrp
 
 Field | Type | Example | Description
 ----- | ---- | ------- | -----------
-rebalance_age | int gauge | | Time elapsed since last rebalance (assign or revoke) (milliseconds)
-rebalance_cnt | int | | Total number of rebalances (assign or revoke)
+state | string | "up"    | Local consumer group handler's state.
+stateage | int gauge | | Time elapsed since last state change (milliseconds).
+joinstate | string | "assigned" | Local consumer group handler's join state.
+rebalance_age | int gauge | | Time elapsed since last rebalance (assign or revoke) (milliseconds).
+rebalance_cnt | int | | Total number of rebalances (assign or revoke).
 rebalance_reason | string | | Last rebalance reason, or empty string.
-assignment_size | int gauge | | Current assignment's partition count
+assignment_size | int gauge | | Current assignment's partition count.
 
 
 ## eos
@@ -201,7 +208,7 @@ assignment_size | int gauge | | Current assignment's partition count
 Field | Type | Example | Description
 ----- | ---- | ------- | -----------
 idemp_state | string | "Assigned" | Current idempotent producer id state
-idemp_state_age | int gauge | | Time elapsed since last idemp_state change (milliseconds)
+idemp_stateage | int gauge | | Time elapsed since last idemp_state change (milliseconds)
 producer_id | int gauge | | The currently assigned Producer ID (or -1)
 producer_epoch | int gauge | | The current epoch (or -1)
 epoch_cnt | int | | The number of Producer ID assignments since start
@@ -214,7 +221,8 @@ This (prettified) example output is from a short-lived producer using the follow
 
 Note: this output is prettified using `jq .`, the JSON object emitted by librdkafka does not contain line breaks.
 
-```{
+```json
+{
   "name": "rdkafka#producer-1",
   "client_id": "rdkafka",
   "type": "producer",
@@ -231,6 +239,8 @@ Note: this output is prettified using `jq .`, the JSON object emitted by librdka
     "localhost:9092/2": {
       "name": "localhost:9092/2",
       "nodeid": 2,
+      "nodename": "localhost:9092",
+      "source": "learned",
       "state": "UP",
       "stateage": 9057234,
       "outbuf_cnt": 0,
@@ -308,6 +318,8 @@ Note: this output is prettified using `jq .`, the JSON object emitted by librdka
     "localhost:9093/3": {
       "name": "localhost:9093/3",
       "nodeid": 3,
+      "nodename": "localhost:9093",
+      "source": "learned",
       "state": "UP",
       "stateage": 9057209,
       "outbuf_cnt": 0,
@@ -385,6 +397,8 @@ Note: this output is prettified using `jq .`, the JSON object emitted by librdka
     "localhost:9094/4": {
       "name": "localhost:9094/4",
       "nodeid": 4,
+      "nodename": "localhost:9094",
+      "source": "learned",
       "state": "UP",
       "stateage": 9057207,
       "outbuf_cnt": 0,

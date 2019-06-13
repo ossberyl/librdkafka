@@ -12,9 +12,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright notice,
  *    this list of conditions and the following disclaimer in the documentation
  *    and/or other materials provided with the distribution. 
- * 
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE 
+ * PRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE 
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE 
  * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE 
  * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR 
@@ -98,7 +96,7 @@ typedef struct rd_kafka_msg_s {
 
         rd_kafka_headers_t *rkm_headers; /**< Parsed headers list, if any. */
 
-        rd_kafka_msg_status_t rkm_status; /**< Persistance status. Updated in
+        rd_kafka_msg_status_t rkm_status; /**< Persistence status. Updated in
                                            *   the ProduceResponse handler:
                                            *   this value is always up to date.
                                            */
@@ -109,10 +107,10 @@ typedef struct rd_kafka_msg_s {
                         rd_ts_t ts_enq;     /* Enqueue/Produce time */
                         rd_ts_t ts_backoff; /* Backoff next Produce until
                                              * this time. */
-                        uint64_t msgseq;    /**< Message sequence number,
+                        uint64_t msgid;     /**< Message sequencial id,
                                              *   used to maintain ordering.
                                              *   Starts at 1. */
-                        uint64_t last_msgseq;/**< On retry this is set
+                        uint64_t last_msgid; /**< On retry this is set
                                               *   on the first message
                                               *   in a batch to point
                                               *   out the last message
@@ -197,14 +195,16 @@ typedef struct rd_kafka_msgq_s {
 /**
  * Returns the number of messages in the specified queue.
  */
-static RD_INLINE RD_UNUSED int rd_kafka_msgq_len (rd_kafka_msgq_t *rkmq) {
+static RD_INLINE RD_UNUSED
+int rd_kafka_msgq_len (const rd_kafka_msgq_t *rkmq) {
         return (int)rkmq->rkmq_msg_cnt;
 }
 
 /**
  * Returns the total number of bytes in the specified queue.
  */
-static RD_INLINE RD_UNUSED size_t rd_kafka_msgq_size (rd_kafka_msgq_t *rkmq) {
+static RD_INLINE RD_UNUSED
+size_t rd_kafka_msgq_size (const rd_kafka_msgq_t *rkmq) {
         return (size_t)rkmq->rkmq_msg_bytes;
 }
 
@@ -223,6 +223,22 @@ static RD_INLINE RD_UNUSED void rd_kafka_msgq_init (rd_kafka_msgq_t *rkmq) {
         rkmq->rkmq_msg_bytes = 0;
 }
 
+#if ENABLE_DEVEL
+#define rd_kafka_msgq_verify_order(rktp,rkmq,exp_first_msgid,gapless) \
+        rd_kafka_msgq_verify_order0(__FUNCTION__, __LINE__, \
+                                    rktp, rkmq, exp_first_msgid, gapless)
+#else
+#define rd_kafka_msgq_verify_order(rktp,rkmq,exp_first_msgid,gapless) \
+        do { } while (0)
+#endif
+
+void rd_kafka_msgq_verify_order0 (const char *function, int line,
+                                  const struct rd_kafka_toppar_s *rktp,
+                                  const rd_kafka_msgq_t *rkmq,
+                                  uint64_t exp_first_msgid,
+                                  rd_bool_t gapless);
+
+
 /**
  * Concat all elements of 'src' onto tail of 'dst'.
  * 'src' will be cleared.
@@ -234,6 +250,7 @@ static RD_INLINE RD_UNUSED void rd_kafka_msgq_concat (rd_kafka_msgq_t *dst,
         dst->rkmq_msg_cnt   += src->rkmq_msg_cnt;
         dst->rkmq_msg_bytes += src->rkmq_msg_bytes;
 	rd_kafka_msgq_init(src);
+        rd_kafka_msgq_verify_order(NULL, dst, 0, rd_false);
 }
 
 /**
@@ -246,6 +263,7 @@ static RD_INLINE RD_UNUSED void rd_kafka_msgq_move (rd_kafka_msgq_t *dst,
         dst->rkmq_msg_cnt   = src->rkmq_msg_cnt;
         dst->rkmq_msg_bytes = src->rkmq_msg_bytes;
 	rd_kafka_msgq_init(src);
+        rd_kafka_msgq_verify_order(NULL, dst, 0, rd_false);
 }
 
 
@@ -259,6 +277,7 @@ static RD_INLINE RD_UNUSED void rd_kafka_msgq_prepend (rd_kafka_msgq_t *dst,
                                                        rd_kafka_msgq_t *src) {
         rd_kafka_msgq_concat(src, dst);
         rd_kafka_msgq_move(dst, src);
+        rd_kafka_msgq_verify_order(NULL, dst, 0, rd_false);
 }
 
 
@@ -318,7 +337,7 @@ rd_kafka_msg_t *rd_kafka_msgq_pop (rd_kafka_msgq_t *rkmq) {
  * @locks caller's responsibility
  */
 static RD_INLINE RD_UNUSED
-rd_kafka_msg_t *rd_kafka_msgq_first (rd_kafka_msgq_t *rkmq) {
+rd_kafka_msg_t *rd_kafka_msgq_first (const rd_kafka_msgq_t *rkmq) {
         return TAILQ_FIRST(&rkmq->rkmq_msgs);
 }
 
@@ -328,56 +347,83 @@ rd_kafka_msg_t *rd_kafka_msgq_first (rd_kafka_msgq_t *rkmq) {
  * @locks caller's responsibility
  */
 static RD_INLINE RD_UNUSED
-rd_kafka_msg_t *rd_kafka_msgq_last (rd_kafka_msgq_t *rkmq) {
+rd_kafka_msg_t *rd_kafka_msgq_last (const rd_kafka_msgq_t *rkmq) {
         return TAILQ_LAST(&rkmq->rkmq_msgs, rd_kafka_msgs_head_s);
 }
 
 
 /**
- * @brief Message ordering comparator using the message sequence
+ * @returns the MsgId of the first message in the queue, or 0 if empty.
+ *
+ * @locks caller's responsibility
+ */
+static RD_INLINE RD_UNUSED
+uint64_t rd_kafka_msgq_first_msgid (const rd_kafka_msgq_t *rkmq) {
+        const rd_kafka_msg_t *rkm = TAILQ_FIRST(&rkmq->rkmq_msgs);
+        if (rkm)
+                return rkm->rkm_u.producer.msgid;
+        else
+                return 0;
+}
+
+
+/**
+ * @brief Message ordering comparator using the message id
  *        number to order messages in ascending order (FIFO).
  */
 static RD_INLINE
-int rd_kafka_msg_cmp_msgseq (const void *_a, const void *_b) {
+int rd_kafka_msg_cmp_msgid (const void *_a, const void *_b) {
         const rd_kafka_msg_t *a = _a, *b = _b;
 
-        rd_dassert(a->rkm_u.producer.msgseq);
+        rd_dassert(a->rkm_u.producer.msgid);
 
-        if (a->rkm_u.producer.msgseq > b->rkm_u.producer.msgseq)
+        if (a->rkm_u.producer.msgid > b->rkm_u.producer.msgid)
                 return 1;
-        else if (a->rkm_u.producer.msgseq < b->rkm_u.producer.msgseq)
+        else if (a->rkm_u.producer.msgid < b->rkm_u.producer.msgid)
                 return -1;
         else
                 return 0;
 }
 
 /**
- * @brief Message ordering comparator using the message sequence
+ * @brief Message ordering comparator using the message id
  *        number to order messages in descending order (LIFO).
  */
 static RD_INLINE
-int rd_kafka_msg_cmp_msgseq_lifo (const void *_a, const void *_b) {
+int rd_kafka_msg_cmp_msgid_lifo (const void *_a, const void *_b) {
         const rd_kafka_msg_t *a = _a, *b = _b;
 
-        rd_dassert(a->rkm_u.producer.msgseq);
+        rd_dassert(a->rkm_u.producer.msgid);
 
-        if (a->rkm_u.producer.msgseq < b->rkm_u.producer.msgseq)
+        if (a->rkm_u.producer.msgid < b->rkm_u.producer.msgid)
                 return 1;
-        else if (a->rkm_u.producer.msgseq > b->rkm_u.producer.msgseq)
+        else if (a->rkm_u.producer.msgid > b->rkm_u.producer.msgid)
                 return -1;
         else
                 return 0;
 }
 
+
 /**
- * @brief Insert message at its sorted position using the msgseq.
+ * @brief Insert message at its sorted position using the msgid.
  * @remark This is an O(n) operation.
- * @warning The message must have a msgseq set.
+ * @warning The message must have a msgid set.
+ * @returns the message count of the queue after enqueuing the message.
+ */
+int
+rd_kafka_msgq_enq_sorted0 (rd_kafka_msgq_t *rkmq,
+                           rd_kafka_msg_t *rkm,
+                           int (*order_cmp) (const void *, const void *));
+
+/**
+ * @brief Insert message at its sorted position using the msgid.
+ * @remark This is an O(n) operation.
+ * @warning The message must have a msgid set.
  * @returns the message count of the queue after enqueuing the message.
  */
 int rd_kafka_msgq_enq_sorted (const rd_kafka_itopic_t *rkt,
-                               rd_kafka_msgq_t *rkmq,
-                               rd_kafka_msg_t *rkm);
+                              rd_kafka_msgq_t *rkmq,
+                              rd_kafka_msg_t *rkm);
 
 /**
  * Insert message at head of message queue.
@@ -401,14 +447,36 @@ static RD_INLINE RD_UNUSED int rd_kafka_msgq_enq (rd_kafka_msgq_t *rkmq,
 
 
 /**
+ * @returns true if the MsgId extents (first, last) in the two queues overlap.
+ */
+static RD_INLINE RD_UNUSED rd_bool_t
+rd_kafka_msgq_overlap (const rd_kafka_msgq_t *a, const rd_kafka_msgq_t *b) {
+        const rd_kafka_msg_t *fa, *la, *fb, *lb;
+
+        if (RD_KAFKA_MSGQ_EMPTY(a) ||
+            RD_KAFKA_MSGQ_EMPTY(b))
+                return rd_false;
+
+        fa = rd_kafka_msgq_first(a);
+        fb = rd_kafka_msgq_first(b);
+        la = rd_kafka_msgq_last(a);
+        lb = rd_kafka_msgq_last(b);
+
+        return (rd_bool_t)
+                (fa->rkm_u.producer.msgid <= lb->rkm_u.producer.msgid &&
+                 fb->rkm_u.producer.msgid <= la->rkm_u.producer.msgid);
+}
+
+/**
  * Scans a message queue for timed out messages and removes them from
  * 'rkmq' and adds them to 'timedout', returning the number of timed out
  * messages.
  * 'timedout' must be initialized.
  */
-int rd_kafka_msgq_age_scan (rd_kafka_msgq_t *rkmq,
-			    rd_kafka_msgq_t *timedout,
-			    rd_ts_t now);
+int rd_kafka_msgq_age_scan (struct rd_kafka_toppar_s *rktp,
+                            rd_kafka_msgq_t *rkmq,
+                            rd_kafka_msgq_t *timedout,
+                            rd_ts_t now);
 
 rd_kafka_msg_t *rd_kafka_msgq_find_pos (const rd_kafka_msgq_t *rkmq,
                                         const rd_kafka_msg_t *rkm,
@@ -418,6 +486,10 @@ rd_kafka_msg_t *rd_kafka_msgq_find_pos (const rd_kafka_msgq_t *rkmq,
 void rd_kafka_msgq_set_metadata (rd_kafka_msgq_t *rkmq,
                                  int64_t base_offset, int64_t timestamp,
                                  rd_kafka_msg_status_t status);
+
+void rd_kafka_msgq_move_acked (rd_kafka_msgq_t *dest, rd_kafka_msgq_t *src,
+                               uint64_t last_msgid,
+                               rd_kafka_msg_status_t status);
 
 int rd_kafka_msg_partitioner (rd_kafka_itopic_t *rkt, rd_kafka_msg_t *rkm,
                               int do_lock);
@@ -439,6 +511,8 @@ static RD_INLINE RD_UNUSED int32_t rd_kafka_seq_wrap (int64_t seq) {
 
 void rd_kafka_msgq_dump (FILE *fp, const char *what, rd_kafka_msgq_t *rkmq);
 
+rd_kafka_msg_t *ut_rd_kafka_msg_new (void);
+void ut_rd_kafka_msgq_purge (rd_kafka_msgq_t *rkmq);
 int unittest_msg (void);
 
 #endif /* _RDKAFKA_MSG_H_ */

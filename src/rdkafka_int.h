@@ -163,9 +163,18 @@ struct rd_kafka_s {
 	TAILQ_HEAD(, rd_kafka_broker_s) rk_brokers;
         rd_list_t                  rk_broker_by_id; /* Fast id lookups. */
 	rd_atomic32_t              rk_broker_cnt;
-        rd_atomic32_t              rk_broker_up_cnt; /**< Number of brokers
-                                                      *   in state >= UP */
+        /**< Number of brokers in state >= UP */
+        rd_atomic32_t              rk_broker_up_cnt;
+        /**< Number of logical brokers in state >= UP, this is a sub-set
+         *   of rk_broker_up_cnt. */
+        rd_atomic32_t              rk_logical_broker_up_cnt;
+        /**< Number of brokers that are down, only includes brokers
+         *   that have had at least one connection attempt. */
 	rd_atomic32_t              rk_broker_down_cnt;
+        /**< Logical brokers currently without an address.
+         *   Used for calculating ERR__ALL_BROKERS_DOWN. */
+        rd_atomic32_t              rk_broker_addrless_cnt;
+
         mtx_t                      rk_internal_rkb_lock;
 	rd_kafka_broker_t         *rk_internal_rkb;
 
@@ -305,7 +314,15 @@ struct rd_kafka_s {
         rd_kafka_timers_t rk_timers;
 	thrd_t rk_thread;
 
-        int rk_initialized;
+        int rk_initialized;       /**< Will be > 0 when the rd_kafka_t
+                                   *   instance has been fully initialized. */
+
+        int   rk_init_wait_cnt;   /**< Number of background threads that
+                                   *   need to finish initialization. */
+        cnd_t rk_init_cnd;        /**< Cond-var used to wait for main thread
+                                   *   to finish its initialization before
+                                   *   before rd_kafka_new() returns. */
+        mtx_t rk_init_lock;       /**< Lock for rk_init_wait and _cmd */
 
         /**
          * Background thread and queue,
@@ -339,12 +356,18 @@ struct rd_kafka_s {
                 /**< Lock for sparse_connect_random */
                 mtx_t         sparse_connect_lock;
         } rk_suppress;
+
+        struct {
+                void *handle; /**< Provider-specific handle struct pointer.
+                               *   Typically assigned in provider's .init() */
+        } rk_sasl;
 };
 
 #define rd_kafka_wrlock(rk)    rwlock_wrlock(&(rk)->rk_lock)
 #define rd_kafka_rdlock(rk)    rwlock_rdlock(&(rk)->rk_lock)
 #define rd_kafka_rdunlock(rk)    rwlock_rdunlock(&(rk)->rk_lock)
 #define rd_kafka_wrunlock(rk)    rwlock_wrunlock(&(rk)->rk_lock)
+
 
 /**
  * @brief Add \p cnt messages and of total size \p size bytes to the
@@ -459,6 +482,7 @@ rd_kafka_curr_msgs_cnt (rd_kafka_t *rk) {
 
 void rd_kafka_destroy_final (rd_kafka_t *rk);
 
+void rd_kafka_global_init (void);
 
 /**
  * @returns true if \p rk handle is terminating.

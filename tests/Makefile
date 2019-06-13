@@ -4,7 +4,7 @@ OBJS	  = $(TESTSRCS_C:%.c=%.o) $(TESTSRCS_CXX:%.cpp=%.o)
 
 BIN	  = merged
 LIBS	 += -lrdkafka++ -lrdkafka -lstdc++
-OBJS	 += test.o testcpp.o tinycthread.o tinycthread_extra.o rdlist.o sockem.o
+OBJS	 += test.o testcpp.o tinycthread.o tinycthread_extra.o rdlist.o sockem.o sockem_ctrl.o
 CFLAGS += -I../src
 CXXFLAGS += -I../src -I../src-cpp
 LDFLAGS += -rdynamic -L../src -L../src-cpp
@@ -34,7 +34,7 @@ sasl: $(BIN)
 	./sasl_test.py --conf '{"parallel":1, "args":"-L"}' --debug $(KAFKA_VERSION)
 
 # Run the full test suite(s)
-full: broker broker_idempotent non_sparse_connections sasl
+full: broker broker_idempotent sasl
 
 
 #
@@ -49,8 +49,6 @@ run_seq: $(BIN)
 	./run-test.sh -p1 ./$(BIN)
 
 run_local: $(BIN)
-	@echo "Running local broker-less tests"
-	./run-test.sh -p5 -l ./$(BIN)
 	@echo "Running local broker-less tests with idempotent producer"
 	./run-test.sh -p5 -l -P ./$(BIN)
 

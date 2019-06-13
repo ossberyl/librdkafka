@@ -132,13 +132,13 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 	rd_kafka_confsource_t  rkb_source;
 	struct {
 		rd_atomic64_t tx_bytes;
-		rd_atomic64_t tx;    /* Kafka-messages (not payload msgs) */
+		rd_atomic64_t tx;            /**< Kafka requests */
 		rd_atomic64_t tx_err;
 		rd_atomic64_t tx_retries;
 		rd_atomic64_t req_timeouts;  /* Accumulated value */
 
 		rd_atomic64_t rx_bytes;
-		rd_atomic64_t rx;    /* Kafka messages (not payload msgs) */
+		rd_atomic64_t rx;            /**< Kafka responses */
 		rd_atomic64_t rx_err;
 		rd_atomic64_t rx_corrid_err; /* CorrId misses */
 		rd_atomic64_t rx_partial;    /* Partial messages received
@@ -152,6 +152,9 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 
                 rd_atomic32_t disconnects;   /**< Disconnects.
                                               *   Always peer-triggered. */
+
+                rd_atomic64_t reqtype[RD_KAFKAP__NUM]; /**< Per request-type
+                                                        *   counter */
 	} rkb_c;
 
         int                 rkb_req_timeouts;  /* Current value */
@@ -191,7 +194,18 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
         uint16_t            rkb_port;                          /* TCP port */
         char               *rkb_origname;                      /* Original
                                                                 * host name */
-
+        int                 rkb_nodename_epoch; /**< Bumped each time
+                                                 *   the nodename is changed.
+                                                 *   Compared to
+                                                 *   rkb_connect_epoch
+                                                 *   to trigger a reconnect
+                                                 *   for logical broker
+                                                 *   when the nodename is
+                                                 *   updated. */
+        int                 rkb_connect_epoch;  /**< The value of
+                                                 *   rkb_nodename_epoch at the
+                                                 *   last connection attempt.
+                                                 */
 
         /* Logging name is a copy of rkb_name, protected by its own mutex */
         char               *rkb_logname;
@@ -250,6 +264,9 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
         struct {
                 /**< Log: compression type not supported by broker. */
                 rd_interval_t unsupported_compression;
+
+                /**< Log: KIP-62 not supported by broker. */
+                rd_interval_t unsupported_kip62;
         } rkb_suppress;
 
 	struct {
@@ -380,6 +397,15 @@ rd_kafka_broker_t *rd_kafka_broker_add (rd_kafka_t *rk,
 					const char *name, uint16_t port,
 					int32_t nodeid);
 
+rd_kafka_broker_t *rd_kafka_broker_add_logical (rd_kafka_t *rk,
+                                                const char *name);
+
+/** @define returns true if broker is logical. No locking is needed. */
+#define RD_KAFKA_BROKER_IS_LOGICAL(rkb) ((rkb)->rkb_source == RD_KAFKA_LOGICAL)
+
+void rd_kafka_broker_set_nodename (rd_kafka_broker_t *rkb,
+                                   rd_kafka_broker_t *from_rkb);
+
 void rd_kafka_broker_connect_up (rd_kafka_broker_t *rkb);
 void rd_kafka_broker_connect_done (rd_kafka_broker_t *rkb, const char *errstr);
 
@@ -388,6 +414,10 @@ int rd_kafka_recv (rd_kafka_broker_t *rkb);
 
 void rd_kafka_dr_msgq (rd_kafka_itopic_t *rkt,
 		       rd_kafka_msgq_t *rkmq, rd_kafka_resp_err_t err);
+
+void rd_kafka_dr_implicit_ack (rd_kafka_broker_t *rkb,
+                               rd_kafka_toppar_t *rktp,
+                               uint64_t last_msgid);
 
 void rd_kafka_broker_buf_enq1 (rd_kafka_broker_t *rkb,
                                rd_kafka_buf_t *rkbuf,

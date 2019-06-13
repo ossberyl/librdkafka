@@ -65,7 +65,7 @@ static const char *test_git_version = "HEAD";
 static const char *test_sockem_conf = "";
 int          test_on_ci = 0; /* Tests are being run on CI, be more forgiving
                               * with regards to timeouts, etc. */
-static int test_idempotent_producer = 0;
+int test_idempotent_producer = 0;
 static int show_summary = 1;
 static int test_summary (int do_lock);
 
@@ -177,10 +177,18 @@ _TEST_DECL(0082_fetch_max_bytes);
 _TEST_DECL(0083_cb_event);
 _TEST_DECL(0084_destroy_flags_local);
 _TEST_DECL(0084_destroy_flags);
+_TEST_DECL(0085_headers);
 _TEST_DECL(0086_purge_local);
 _TEST_DECL(0086_purge_remote);
 _TEST_DECL(0088_produce_metadata_timeout);
 _TEST_DECL(0089_max_poll_interval);
+_TEST_DECL(0090_idempotence);
+_TEST_DECL(0091_max_poll_interval_timeout);
+_TEST_DECL(0092_mixed_msgver);
+_TEST_DECL(0093_holb_consumer);
+_TEST_DECL(0094_idempotence_msg_timeout);
+_TEST_DECL(0095_all_brokers_down);
+_TEST_DECL(0097_ssl_verify);
 
 /* Manual tests */
 _TEST_DECL(8000_idle);
@@ -213,7 +221,8 @@ struct test tests[] = {
         _TEST(0021_rkt_destroy, 0),
         _TEST(0022_consume_batch, 0),
         _TEST(0025_timers, TEST_F_LOCAL),
-	_TEST(0026_consume_pause, 0, TEST_BRKVER(0,9,0,0)),
+	_TEST(0026_consume_pause, TEST_F_KNOWN_ISSUE, TEST_BRKVER(0,9,0,0),
+                .extra = "Fragile test due to #2190"),
 	_TEST(0028_long_topicnames, TEST_F_KNOWN_ISSUE, TEST_BRKVER(0,9,0,0),
 	      .extra = "https://github.com/edenhill/librdkafka/issues/529"),
 	_TEST(0029_assign_offset, 0),
@@ -289,12 +298,23 @@ struct test tests[] = {
         _TEST(0083_cb_event, 0, TEST_BRKVER(0,9,0,0)),
         _TEST(0084_destroy_flags_local, TEST_F_LOCAL),
         _TEST(0084_destroy_flags, 0),
+        _TEST(0085_headers, 0, TEST_BRKVER(0,11,0,0)),
         _TEST(0086_purge_local, TEST_F_LOCAL),
         _TEST(0086_purge_remote, 0),
 #if WITH_SOCKEM
         _TEST(0088_produce_metadata_timeout, TEST_F_SOCKEM),
 #endif
         _TEST(0089_max_poll_interval, 0, TEST_BRKVER(0,10,1,0)),
+        _TEST(0090_idempotence, 0, TEST_BRKVER(0,11,0,0)),
+        _TEST(0091_max_poll_interval_timeout, 0, TEST_BRKVER(0,10,1,0)),
+        _TEST(0092_mixed_msgver, 0, TEST_BRKVER(0,11,0,0)),
+        _TEST(0093_holb_consumer, 0, TEST_BRKVER(0,10,1,0)),
+#if WITH_SOCKEM
+        _TEST(0094_idempotence_msg_timeout, TEST_F_SOCKEM,
+              TEST_BRKVER(0,11,0,0)),
+#endif
+        _TEST(0095_all_brokers_down, TEST_F_LOCAL),
+        _TEST(0097_ssl_verify, 0),
 
         /* Manual tests */
         _TEST(8000_idle, TEST_F_MANUAL),
@@ -533,6 +553,10 @@ static void test_init (void) {
 const char *test_mk_topic_name (const char *suffix, int randomized) {
         static RD_TLS char ret[512];
 
+        /* Strip main_ prefix (caller is using __FUNCTION__) */
+        if (!strncmp(suffix, "main_", 5))
+                suffix += 5;
+
         if (test_topic_random || randomized)
                 rd_snprintf(ret, sizeof(ret), "%s_rnd%"PRIx64"_%s",
                          test_topic_prefix, test_id_generate(), suffix);
@@ -736,34 +760,6 @@ void test_conf_init (rd_kafka_conf_t **conf, rd_kafka_topic_conf_t **topic_conf,
                             topic_conf ? *topic_conf : NULL, &timeout);
 
         test_conf_common_init(conf ? *conf : NULL, timeout);
-}
-
-
-/**
- * Wait 'timeout' seconds for rdkafka to kill all its threads and clean up.
- */
-void test_wait_exit (int timeout) {
-	int r;
-        time_t start = time(NULL);
-
-	while ((r = rd_kafka_thread_cnt()) && timeout-- >= 0) {
-		TEST_SAY("%i thread(s) in use by librdkafka, waiting...\n", r);
-		rd_sleep(1);
-	}
-
-	TEST_SAY("%i thread(s) in use by librdkafka\n", r);
-
-        if (r > 0)
-                TEST_FAIL("%i thread(s) still active in librdkafka", r);
-
-        timeout -= (int)(time(NULL) - start);
-        if (timeout > 0) {
-		TEST_SAY("Waiting %d seconds for all librdkafka memory "
-			 "to be released\n", timeout);
-                if (rd_kafka_wait_destroyed(timeout * 1000) == -1)
-                        TEST_FAIL("Not all internal librdkafka "
-                                  "objects destroyed\n");
-	}
 }
 
 
@@ -980,6 +976,43 @@ static int run_test_from_thread (void *arg) {
 }
 
 
+/**
+ * @brief Check running tests for timeouts.
+ * @locks TEST_LOCK MUST be held
+ */
+static void check_test_timeouts (void) {
+        int64_t now = test_clock();
+        struct test *test;
+
+        for (test = tests ; test->name ; test++) {
+                if (test->state != TEST_RUNNING)
+                        continue;
+
+                /* Timeout check */
+                if (now > test->timeout) {
+                        struct test *save_test = test_curr;
+                        test_curr = test;
+                        test->state = TEST_FAILED;
+                        test_summary(0/*no-locks*/);
+                        TEST_FAIL0(__FILE__,__LINE__,0/*nolock*/,
+                                   0/*fail-later*/,
+                                   "Test %s timed out "
+                                   "(timeout set to %d seconds)\n",
+                                   test->name,
+                                   (int)(test->timeout-
+                                         test->start)/
+                                   1000000);
+                        test_curr = save_test;
+                        tests_running_cnt--; /* fail-later misses this*/
+#ifdef _MSC_VER
+                        TerminateThread(test->thrd, -1);
+#else
+                        pthread_kill(test->thrd, SIGKILL);
+#endif
+                }
+        }
+}
+
 
 static int run_test (struct test *test, int argc, char **argv) {
         struct run_args *run_args = calloc(1, sizeof(*run_args));
@@ -997,9 +1030,11 @@ static int run_test (struct test *test, int argc, char **argv) {
                                  tests_running_cnt, test_concurrent_max,
                                  test->name);
                 cnd_timedwait_ms(&test_cnd, &test_mtx, 100);
+
+                check_test_timeouts();
         }
         tests_running_cnt++;
-        test->timeout = test_clock() + (int64_t)(20.0 * 1000000.0 *
+        test->timeout = test_clock() + (int64_t)(30.0 * 1000000.0 *
                                                  test_timeout_multiplier);
         test->state = TEST_RUNNING;
         TEST_UNLOCK();
@@ -1290,6 +1325,36 @@ static void test_sig_term (int sig) {
 #endif
 
 /**
+ * Wait 'timeout' seconds for rdkafka to kill all its threads and clean up.
+ */
+static void test_wait_exit (int timeout) {
+	int r;
+        time_t start = time(NULL);
+
+	while ((r = rd_kafka_thread_cnt()) && timeout-- >= 0) {
+		TEST_SAY("%i thread(s) in use by librdkafka, waiting...\n", r);
+		rd_sleep(1);
+	}
+
+	TEST_SAY("%i thread(s) in use by librdkafka\n", r);
+
+        if (r > 0)
+                TEST_FAIL("%i thread(s) still active in librdkafka", r);
+
+        timeout -= (int)(time(NULL) - start);
+        if (timeout > 0) {
+		TEST_SAY("Waiting %d seconds for all librdkafka memory "
+			 "to be released\n", timeout);
+                if (rd_kafka_wait_destroyed(timeout * 1000) == -1)
+                        TEST_FAIL("Not all internal librdkafka "
+                                  "objects destroyed\n");
+	}
+}
+
+
+
+
+/**
  * @brief Test framework cleanup before termination.
  */
 static void test_cleanup (void) {
@@ -1468,7 +1533,7 @@ int main(int argc, char **argv) {
                         TEST_SAY("Current directory: %s\n", cwd);
         }
 
-        test_timeout_set(20);
+        test_timeout_set(30);
 
         TIMING_START(&t_all, "ALL-TESTS");
 
@@ -1478,7 +1543,6 @@ int main(int argc, char **argv) {
         TEST_LOCK();
         while (tests_running_cnt > 0 && !test_exit) {
                 struct test *test;
-		int64_t now = test_clock();
 
                 TEST_SAY("%d test(s) running:", tests_running_cnt);
                 for (test = tests ; test->name ; test++) {
@@ -1487,32 +1551,13 @@ int main(int argc, char **argv) {
 
 			if (test_level >= 2)
 				TEST_SAY0(" %s", test->name);
+                }
 
-			/* Timeout check */
-			if (now > test->timeout) {
-                                struct test *save_test = test_curr;
-                                test_curr = test;
-				test->state = TEST_FAILED;
-				test_summary(0/*no-locks*/);
-                                TEST_FAIL0(__FILE__,__LINE__,0/*nolock*/,
-                                           0/*fail-later*/,
-                                           "Test %s timed out "
-                                           "(timeout set to %d seconds)\n",
-                                           test->name,
-                                           (int)(test->timeout-
-                                                 test->start)/
-                                           1000000);
-                                test_curr = save_test;
-                                tests_running_cnt--; /* fail-later misses this*/
-#ifdef _MSC_VER
-                                TerminateThread(test->thrd, -1);
-#else
-                                pthread_kill(test->thrd, SIGKILL);
-#endif
-                        }
-		}
 		if (test_level >= 2)
 			TEST_SAY0("\n");
+
+                check_test_timeouts();
+
                 TEST_UNLOCK();
 
                 rd_sleep(1);
@@ -1719,7 +1764,7 @@ rd_kafka_topic_t *test_create_producer_topic (rd_kafka_t *rk,
 void test_produce_msgs_nowait (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
                                uint64_t testid, int32_t partition,
                                int msg_base, int cnt,
-                               const char *payload, size_t size,
+                               const char *payload, size_t size, int msgrate,
                                int *msgcounterp) {
 	int msg_id;
 	test_timing_t t_all, t_poll;
@@ -1727,6 +1772,11 @@ void test_produce_msgs_nowait (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
 	void *buf;
 	int64_t tot_bytes = 0;
         int64_t tot_time_poll = 0;
+        int64_t per_msg_wait = 0;
+
+        if (msgrate > 0)
+                per_msg_wait = 1000000 / (int64_t)msgrate;
+
 
 	if (payload)
 		buf = (void *)payload;
@@ -1743,6 +1793,7 @@ void test_produce_msgs_nowait (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
         TIMING_START(&t_poll, "SUM(POLL)");
 
 	for (msg_id = msg_base ; msg_id < msg_base + cnt ; msg_id++) {
+                int wait_time = 0;
 
                 if (!payload)
                         test_prepare_msg(testid, partition, msg_id,
@@ -1764,7 +1815,17 @@ void test_produce_msgs_nowait (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
 		tot_bytes += size;
 
                 TIMING_RESTART(&t_poll);
-		rd_kafka_poll(rk, 0);
+                do {
+                        if (per_msg_wait) {
+                                wait_time = (int)(per_msg_wait -
+                                                  TIMING_DURATION(&t_poll)) /
+                                        1000;
+                                if (wait_time < 0)
+                                        wait_time = 0;
+                        }
+                        rd_kafka_poll(rk, wait_time);
+                } while (wait_time > 0);
+
                 tot_time_poll = TIMING_DURATION(&t_poll);
 
 		if (TIMING_EVERY(&t_all, 3*1000000))
@@ -1826,7 +1887,23 @@ void test_produce_msgs (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
 	int remains = 0;
 
         test_produce_msgs_nowait(rk, rkt, testid, partition, msg_base, cnt,
-                                 payload, size, &remains);
+                                 payload, size, 0, &remains);
+
+        test_wait_delivery(rk, &remains);
+}
+
+
+/**
+ * Produces \p cnt messages at \p msgs/s, and waits for succesful delivery
+ */
+void test_produce_msgs_rate (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
+                             uint64_t testid, int32_t partition,
+                             int msg_base, int cnt,
+                             const char *payload, size_t size, int msgrate) {
+	int remains = 0;
+
+        test_produce_msgs_nowait(rk, rkt, testid, partition, msg_base, cnt,
+                                 payload, size, msgrate, &remains);
 
         test_wait_delivery(rk, &remains);
 }
@@ -2079,32 +2156,51 @@ int64_t test_consume_msgs (const char *what, rd_kafka_topic_t *rkt,
  * and expects \d exp_msgcnt with matching \p testid
  * Destroys consumer when done.
  *
+ * @param partition If -1 the topic will be subscribed to, otherwise the
+ *                  single partition will be assigned immediately.
+ *
  * If \p group_id is NULL a new unique group is generated
  */
 void
 test_consume_msgs_easy_mv (const char *group_id, const char *topic,
+                           int32_t partition,
                            uint64_t testid, int exp_eofcnt, int exp_msgcnt,
                            rd_kafka_topic_conf_t *tconf,
                            test_msgver_t *mv) {
         rd_kafka_t *rk;
         char grpid0[64];
+        rd_kafka_conf_t *conf;
 
-        if (!tconf)
-                test_conf_init(NULL, &tconf, 0);
+        test_conf_init(&conf, tconf ? NULL : &tconf, 0);
 
         if (!group_id)
                 group_id = test_str_id_generate(grpid0, sizeof(grpid0));
 
         test_topic_conf_set(tconf, "auto.offset.reset", "smallest");
-        rk = test_create_consumer(group_id, NULL, NULL, tconf);
+        if (exp_eofcnt != -1)
+                test_conf_set(conf, "enable.partition.eof", "true");
+        rk = test_create_consumer(group_id, NULL, conf, tconf);
 
         rd_kafka_poll_set_consumer(rk);
 
-        TEST_SAY("Subscribing to topic %s in group %s "
-                 "(expecting %d msgs with testid %"PRIu64")\n",
-                 topic, group_id, exp_msgcnt, testid);
+        if (partition == -1) {
+                TEST_SAY("Subscribing to topic %s in group %s "
+                         "(expecting %d msgs with testid %"PRIu64")\n",
+                         topic, group_id, exp_msgcnt, testid);
 
-        test_consumer_subscribe(rk, topic);
+                test_consumer_subscribe(rk, topic);
+        } else {
+                rd_kafka_topic_partition_list_t *plist;
+
+                TEST_SAY("Assign topic %s [%"PRId32"] in group %s "
+                         "(expecting %d msgs with testid %"PRIu64")\n",
+                         topic, partition, group_id, exp_msgcnt, testid);
+
+                plist = rd_kafka_topic_partition_list_new(1);
+                rd_kafka_topic_partition_list_add(plist, topic, partition);
+                test_consumer_assign("consume_easy_mv", rk, plist);
+                rd_kafka_topic_partition_list_destroy(plist);
+        }
 
         /* Consume messages */
         test_consumer_poll("consume.easy", rk, testid, exp_eofcnt,
@@ -2123,7 +2219,7 @@ test_consume_msgs_easy (const char *group_id, const char *topic,
 
         test_msgver_init(&mv, testid);
 
-        test_consume_msgs_easy_mv(group_id, topic, testid, exp_eofcnt,
+        test_consume_msgs_easy_mv(group_id, topic, -1, testid, exp_eofcnt,
                                   exp_msgcnt, tconf, &mv);
 
         test_msgver_clear(&mv);
@@ -2300,6 +2396,21 @@ static RD_INLINE struct test_mv_m *test_mv_mvec_get (struct test_mv_mvec *mvec,
                 return NULL;
 	return &mvec->m[mi];
 }
+
+/**
+ * @returns the message with msgid \p msgid, or NULL.
+ */
+static struct test_mv_m *test_mv_mvec_find_by_msgid (struct test_mv_mvec *mvec,
+                                                     int msgid) {
+        int mi;
+
+        for (mi = 0 ; mi < mvec->cnt ; mi++)
+                if (mvec->m[mi].msgid == msgid)
+                        return &mvec->m[mi];
+
+        return NULL;
+}
+
 
 /**
  * Print message list to \p fp
@@ -2489,6 +2600,7 @@ static int test_mv_mvec_verify_corr (test_msgver_t *mv, int flags,
         int fails = 0;
         struct test_mv_p *corr_p = NULL;
         struct test_mv_mvec *corr_mvec;
+        int verifycnt = 0;
 
         TEST_ASSERT(vs->corr);
 
@@ -2508,23 +2620,33 @@ static int test_mv_mvec_verify_corr (test_msgver_t *mv, int flags,
 
         for (mi = 0 ; mi < mvec->cnt ; mi++) {
                 struct test_mv_m *this = test_mv_mvec_get(mvec, mi);
-                const struct test_mv_m *corr = test_mv_mvec_get(corr_mvec, mi);
+                const struct test_mv_m *corr;
+
+
+                if (flags & TEST_MSGVER_SUBSET)
+                        corr = test_mv_mvec_find_by_msgid(corr_mvec,
+                                                          this->msgid);
+                else
+                        corr = test_mv_mvec_get(corr_mvec, mi);
 
                 if (0)
                         TEST_MV_WARN(mv,
                                      "msg #%d: msgid %d, offset %"PRId64"\n",
                                      mi, this->msgid, this->offset);
                 if (!corr) {
-                        TEST_MV_WARN(
-                                mv,
-                                " %s [%"PRId32"] msg rcvidx #%d/%d: "
-                                "out of range: correct mvec has %d messages: "
-                                "message offset %"PRId64", msgid %d\n",
-                                p ? p->topic : "*",
-                                p ? p->partition : -1,
-                                mi, mvec->cnt, corr_mvec->cnt,
-                                this->offset, this->msgid);
-                        fails++;
+                        if (!(flags & TEST_MSGVER_SUBSET)) {
+                                TEST_MV_WARN(
+                                        mv,
+                                        " %s [%"PRId32"] msg rcvidx #%d/%d: "
+                                        "out of range: correct mvec has "
+                                        "%d messages: "
+                                        "message offset %"PRId64", msgid %d\n",
+                                        p ? p->topic : "*",
+                                        p ? p->partition : -1,
+                                        mi, mvec->cnt, corr_mvec->cnt,
+                                        this->offset, this->msgid);
+                                fails++;
+                        }
                         continue;
                 }
 
@@ -2549,7 +2671,21 @@ static int test_mv_mvec_verify_corr (test_msgver_t *mv, int flags,
                                 this->timestamp, corr->timestamp,
                                 flags);
                         fails++;
+                } else {
+                        verifycnt++;
                 }
+        }
+
+        if (verifycnt != corr_mvec->cnt &&
+            !(flags & TEST_MSGVER_SUBSET)) {
+                TEST_MV_WARN(
+                        mv,
+                        " %s [%"PRId32"]: of %d input messages, "
+                        "only %d/%d matched correct messages\n",
+                        p ? p->topic : "*",
+                        p ? p->partition : -1,
+                        mvec->cnt, verifycnt, corr_mvec->cnt);
+                fails++;
         }
 
         return fails;
@@ -2927,9 +3063,11 @@ int test_msgver_verify0 (const char *func, int line, const char *what,
 			  func, line, what, mv->log_suppr_cnt);
 
 	if (vs.exp_cnt != mv->msgcnt) {
-		TEST_WARN("%s:%d: %s: expected %d messages, got %d\n",
-			  func, line, what, vs.exp_cnt, mv->msgcnt);
-		fails++;
+                if (!(flags & TEST_MSGVER_SUBSET)) {
+                        TEST_WARN("%s:%d: %s: expected %d messages, got %d\n",
+                                  func, line, what, vs.exp_cnt, mv->msgcnt);
+                        fails++;
+                }
 	}
 
 	if (fails)
@@ -3018,9 +3156,11 @@ void test_msgver_verify_compare0 (const char *func, int line,
                           func, line, what, mv->log_suppr_cnt);
 
         if (corr->msgcnt != mv->msgcnt) {
-                TEST_WARN("%s:%d: %s: expected %d messages, got %d\n",
-                          func, line, what, corr->msgcnt, mv->msgcnt);
-                fails++;
+                if (!(flags & TEST_MSGVER_SUBSET)) {
+                        TEST_WARN("%s:%d: %s: expected %d messages, got %d\n",
+                                  func, line, what, corr->msgcnt, mv->msgcnt);
+                        fails++;
+                }
         }
 
         if (fails)
@@ -3152,7 +3292,8 @@ int test_consumer_poll_once (rd_kafka_t *rk, test_msgver_t *mv, int timeout_ms){
 	rd_kafka_message_destroy(rkmessage);
 	return 1;
 }
-	
+
+
 int test_consumer_poll (const char *what, rd_kafka_t *rk, uint64_t testid,
                         int exp_eof_cnt, int exp_msg_base, int exp_cnt,
 			test_msgver_t *mv) {
@@ -4064,17 +4205,21 @@ test_wait_admin_result (rd_kafka_queue_t *q,
 
 /**
  * @brief Wait for up to \p tmout for a
- *        CreateTopics/DeleteTopics/CreatePartitions result
- *        and return the distilled error code.
+ *        CreateTopics/DeleteTopics/CreatePartitions or
+ *        DescribeConfigs/AlterConfigs result and return the
+ *        distilled error code.
  */
 rd_kafka_resp_err_t
 test_wait_topic_admin_result (rd_kafka_queue_t *q,
                               rd_kafka_event_type_t evtype,
+                              rd_kafka_event_t **retevent,
                               int tmout) {
         rd_kafka_event_t *rkev;
         size_t i;
         const rd_kafka_topic_result_t **terr = NULL;
         size_t terr_cnt = 0;
+        const rd_kafka_ConfigResource_t **cres = NULL;
+        size_t cres_cnt = 0;
         int errcnt = 0;
         rd_kafka_resp_err_t err;
 
@@ -4112,11 +4257,31 @@ test_wait_topic_admin_result (rd_kafka_queue_t *q,
 
                 terr = rd_kafka_CreatePartitions_result_topics(res, &terr_cnt);
 
+        } else if (evtype == RD_KAFKA_EVENT_DESCRIBECONFIGS_RESULT) {
+                const rd_kafka_DescribeConfigs_result_t *res;
+
+                if (!(res = rd_kafka_event_DescribeConfigs_result(rkev)))
+                        TEST_FAIL("Expected a DescribeConfigs result, not %s",
+                                  rd_kafka_event_name(rkev));
+
+                cres = rd_kafka_DescribeConfigs_result_resources(res,
+                                                                 &cres_cnt);
+
+        } else if (evtype == RD_KAFKA_EVENT_ALTERCONFIGS_RESULT) {
+                const rd_kafka_AlterConfigs_result_t *res;
+
+                if (!(res = rd_kafka_event_AlterConfigs_result(rkev)))
+                        TEST_FAIL("Expected a AlterConfigs result, not %s",
+                                  rd_kafka_event_name(rkev));
+
+                cres = rd_kafka_AlterConfigs_result_resources(res, &cres_cnt);
+
         } else {
                 TEST_FAIL("Bad evtype: %d", evtype);
                 RD_NOTREACHED();
         }
 
+        /* Check topic errors */
         for (i = 0 ; i < terr_cnt ; i++) {
                 if (rd_kafka_topic_result_error(terr[i])) {
                         TEST_WARN("..Topics result: %s: error: %s\n",
@@ -4127,7 +4292,22 @@ test_wait_topic_admin_result (rd_kafka_queue_t *q,
                 }
         }
 
-        rd_kafka_event_destroy(rkev);
+        /* Check resource errors */
+        for (i = 0 ; i < cres_cnt ; i++) {
+                if (rd_kafka_ConfigResource_error(cres[i])) {
+                        TEST_WARN("ConfigResource result: %d,%s: error: %s\n",
+                                  rd_kafka_ConfigResource_type(cres[i]),
+                                  rd_kafka_ConfigResource_name(cres[i]),
+                                  rd_kafka_ConfigResource_error_string(cres[i]));
+                        if (!(errcnt++))
+                                err = rd_kafka_ConfigResource_error(cres[i]);
+                }
+        }
+
+        if (!err && retevent)
+                *retevent = rkev;
+        else
+                rd_kafka_event_destroy(rkev);
 
         return err;
 }
@@ -4206,7 +4386,7 @@ test_CreateTopics_simple (rd_kafka_t *rk,
 
         err = test_wait_topic_admin_result(q,
                                            RD_KAFKA_EVENT_CREATETOPICS_RESULT,
-                                           tmout+5000);
+                                           NULL, tmout+5000);
 
         rd_kafka_queue_destroy(q);
 
@@ -4274,7 +4454,7 @@ test_CreatePartitions_simple (rd_kafka_t *rk,
 
 
         err = test_wait_topic_admin_result(
-                q, RD_KAFKA_EVENT_CREATEPARTITIONS_RESULT, tmout+5000);
+                q, RD_KAFKA_EVENT_CREATEPARTITIONS_RESULT, NULL, tmout+5000);
 
         rd_kafka_queue_destroy(q);
 
@@ -4342,7 +4522,7 @@ test_DeleteTopics_simple (rd_kafka_t *rk,
 
         err = test_wait_topic_admin_result(q,
                                            RD_KAFKA_EVENT_CREATETOPICS_RESULT,
-                                           tmout+5000);
+                                           NULL, tmout+5000);
 
         rd_kafka_queue_destroy(q);
 
@@ -4352,6 +4532,97 @@ test_DeleteTopics_simple (rd_kafka_t *rk,
 
         return err;
 }
+
+
+/**
+ * @brief Delta Alter configuration for the given resource,
+ *        overwriting/setting the configs provided in \p configs.
+ *        Existing configuration remains intact.
+ *
+ * @param configs 'const char *name, const char *value' tuples
+ * @param config_cnt is the number of tuples in \p configs
+ */
+rd_kafka_resp_err_t
+test_AlterConfigs_simple (rd_kafka_t *rk,
+                          rd_kafka_ResourceType_t restype,
+                          const char *resname,
+                          const char **configs, size_t config_cnt) {
+        rd_kafka_queue_t *q;
+        rd_kafka_ConfigResource_t *confres;
+        rd_kafka_event_t *rkev;
+        size_t i;
+        rd_kafka_resp_err_t err;
+        const rd_kafka_ConfigResource_t **results;
+        size_t result_cnt;
+        const rd_kafka_ConfigEntry_t **configents;
+        size_t configent_cnt;
+
+
+        q = rd_kafka_queue_new(rk);
+
+        TEST_SAY("Getting configuration for %d %s\n", restype, resname);
+
+        confres = rd_kafka_ConfigResource_new(restype, resname);
+        rd_kafka_DescribeConfigs(rk, &confres, 1, NULL, q);
+
+        err = test_wait_topic_admin_result(
+                q, RD_KAFKA_EVENT_DESCRIBECONFIGS_RESULT, &rkev, 15*1000);
+        if (err) {
+                rd_kafka_queue_destroy(q);
+                rd_kafka_ConfigResource_destroy(confres);
+                return err;
+        }
+
+        results = rd_kafka_DescribeConfigs_result_resources(
+                rd_kafka_event_DescribeConfigs_result(rkev), &result_cnt);
+        TEST_ASSERT(result_cnt == 1,
+                    "expected 1 DescribeConfigs result, not %"PRIusz,
+                    result_cnt);
+
+        configents = rd_kafka_ConfigResource_configs(results[0],
+                                                     &configent_cnt);
+        TEST_ASSERT(configent_cnt > 0,
+                    "expected > 0 ConfigEntry:s, not %"PRIusz, configent_cnt);
+
+        TEST_SAY("Altering configuration for %d %s\n", restype, resname);
+
+        /* Apply all existing configuration entries to resource object that
+         * will later be passed to AlterConfigs. */
+        for (i = 0 ; i < configent_cnt ; i++) {
+                err = rd_kafka_ConfigResource_set_config(
+                        confres,
+                        rd_kafka_ConfigEntry_name(configents[i]),
+                        rd_kafka_ConfigEntry_value(configents[i]));
+                TEST_ASSERT(!err, "Failed to set read-back config %s=%s "
+                            "on local resource object",
+                            rd_kafka_ConfigEntry_name(configents[i]),
+                            rd_kafka_ConfigEntry_value(configents[i]));
+        }
+
+        rd_kafka_event_destroy(rkev);
+
+        /* Then apply the configuration to change. */
+        for (i = 0 ; i < config_cnt ; i += 2) {
+                err = rd_kafka_ConfigResource_set_config(confres,
+                                                         configs[i],
+                                                         configs[i+1]);
+                TEST_ASSERT(!err, "Failed to set config %s=%s on "
+                            "local resource object",
+                            configs[i], configs[i+1]);
+        }
+
+        rd_kafka_AlterConfigs(rk, &confres, 1, NULL, q);
+
+        rd_kafka_ConfigResource_destroy(confres);
+
+        err = test_wait_topic_admin_result(
+                q, RD_KAFKA_EVENT_ALTERCONFIGS_RESULT, NULL, 15*1000);
+
+        rd_kafka_queue_destroy(q);
+
+        return err;
+}
+
 
 
 static void test_free_string_array (char **strs, size_t cnt) {

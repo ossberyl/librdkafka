@@ -103,9 +103,10 @@ class StatsCb : public RdKafka::EventCb {
       Test::Fail("Nothing following consumer_lag");
 
     int64_t lag = strtoull(remain, NULL, 0);
-    if (lag == -1)
-      Test::Say(tostr() << "Consumer lag " << lag << " is invalid, stats:\n" <<
-                json_doc << "\n");
+    if (lag == -1) {
+      Test::Say(tostr() << "Consumer lag " << lag << " is invalid, stats:\n");
+      Test::Say(3, tostr() << json_doc << "\n");
+    }
     return lag;
   }
 };
@@ -126,13 +127,12 @@ static void do_test_consumer_lag (void) {
 
   /* Create consumer */
   RdKafka::Conf *conf;
-  Test::conf_init(&conf, NULL, 10);
+  Test::conf_init(&conf, NULL, 40);
   StatsCb stats;
   if (conf->set("event_cb", &stats, errstr) != RdKafka::Conf::CONF_OK)
     Test::Fail("set event_cb failed: " + errstr);
   Test::conf_set(conf, "group.id", topic);
   Test::conf_set(conf, "enable.auto.commit", "false");
-  Test::conf_set(conf, "enable.partition.eof", "false");
   Test::conf_set(conf, "auto.offset.reset", "earliest");
   Test::conf_set(conf, "statistics.interval.ms", "100");
 
@@ -142,7 +142,6 @@ static void do_test_consumer_lag (void) {
   delete conf;
 
   /* Assign partitions */
-  /* Subscribe */
   std::vector<RdKafka::TopicPartition*> parts;
   parts.push_back(RdKafka::TopicPartition::create(topic, 0));
   if ((err = c->assign(parts)))
@@ -159,7 +158,8 @@ static void do_test_consumer_lag (void) {
       case RdKafka::ERR__TIMED_OUT:
         break;
       case RdKafka::ERR__PARTITION_EOF:
-        Test::Fail(tostr() << "Consume error after " << cnt << "/" << msgcnt << " messages: " << msg->errstr());
+        Test::Fail(tostr() << "Unexpected PARTITION_EOF (not enbaled) after "
+                   << cnt << "/" << msgcnt << " messages: " << msg->errstr());
         break;
 
       case RdKafka::ERR_NO_ERROR:

@@ -68,20 +68,13 @@ extern double test_timeout_multiplier;
 extern int  test_session_timeout_ms; /* Group session timeout */
 extern int  test_flags;
 extern int  test_neg_flags;
+extern int  test_idempotent_producer;
 
 extern mtx_t test_mtx;
 
 #define TEST_LOCK()   mtx_lock(&test_mtx)
 #define TEST_UNLOCK() mtx_unlock(&test_mtx)
 
-
-#define _C_CLR "\033[0m"
-#define _C_RED "\033[31m"
-#define _C_GRN "\033[32m"
-#define _C_YEL "\033[33m"
-#define _C_BLU "\033[34m"
-#define _C_MAG "\033[35m"
-#define _C_CYA "\033[36m"
 
 typedef enum {
         TEST_NOT_STARTED,
@@ -244,8 +237,6 @@ void test_conf_init (rd_kafka_conf_t **conf, rd_kafka_topic_conf_t **topic_conf,
 		     int timeout);
 
 
-void test_wait_exit (int timeout);
-
 
 
 
@@ -374,6 +365,9 @@ int test_msgver_add_msg0 (const char *func, int line,
 #define TEST_MSGVER_BY_OFFSET 0x20000 /* Verify by offset (unique in partition)*/
 #define TEST_MSGVER_BY_TIMESTAMP 0x40000 /* Verify by timestamp range */
 
+#define TEST_MSGVER_SUBSET 0x100000  /* verify_compare: allow correct mv to be
+                                      * a subset of mv. */
+
 /* Only test per partition, not across all messages received on all partitions.
  * This is useful when doing incremental verifications with multiple partitions
  * and the total number of messages has not been received yet.
@@ -427,12 +421,16 @@ void test_wait_delivery (rd_kafka_t *rk, int *msgcounterp);
 void test_produce_msgs_nowait (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
                                uint64_t testid, int32_t partition,
                                int msg_base, int cnt,
-                               const char *payload, size_t size,
+                               const char *payload, size_t size, int msgrate,
                                int *msgcounterp);
 void test_produce_msgs (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
                         uint64_t testid, int32_t partition,
                         int msg_base, int cnt,
 			const char *payload, size_t size);
+void test_produce_msgs_rate (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
+                             uint64_t testid, int32_t partition,
+                             int msg_base, int cnt,
+                             const char *payload, size_t size, int msgrate);
 rd_kafka_resp_err_t test_produce_sync (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
                                        uint64_t testid, int32_t partition);
 
@@ -474,6 +472,7 @@ void test_consumer_subscribe (rd_kafka_t *rk, const char *topic);
 
 void
 test_consume_msgs_easy_mv (const char *group_id, const char *topic,
+                           int32_t partition,
                            uint64_t testid, int exp_eofcnt, int exp_msgcnt,
                            rd_kafka_topic_conf_t *tconf,
                            test_msgver_t *mv);
@@ -522,8 +521,6 @@ int test_check_auto_create_topic (void);
 int test_get_partition_count (rd_kafka_t *rk, const char *topicname,
                               int timeout_ms);
 
-int test_check_builtin (const char *feature);
-
 char *tsprintf (const char *fmt, ...) RD_FORMAT(printf, 1, 2);
 
 void test_report_add (struct test *test, const char *fmt, ...);
@@ -564,6 +561,7 @@ test_wait_admin_result (rd_kafka_queue_t *q,
 rd_kafka_resp_err_t
 test_wait_topic_admin_result (rd_kafka_queue_t *q,
                               rd_kafka_event_type_t evtype,
+                              rd_kafka_event_t **retevent,
                               int tmout);
 
 rd_kafka_resp_err_t
@@ -584,6 +582,12 @@ test_DeleteTopics_simple (rd_kafka_t *rk,
                           rd_kafka_queue_t *useq,
                           char **topics, size_t topic_cnt,
                           void *opaque);
+
+rd_kafka_resp_err_t
+test_AlterConfigs_simple (rd_kafka_t *rk,
+                          rd_kafka_ResourceType_t restype,
+                          const char *resname,
+                          const char **configs, size_t config_cnt);
 
 rd_kafka_resp_err_t test_delete_all_test_topics (int timeout_ms);
 

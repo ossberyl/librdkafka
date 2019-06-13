@@ -41,6 +41,7 @@ set(
     rdkafka_aux.c
     rdkafka_background.c
     rdkafka_idempotence.c
+    rdkafka_cert.c
     rdlist.c
     rdlog.c
     rdmurmur2.c
@@ -54,10 +55,15 @@ set(
     tinycthread.c
     tinycthread_extra.c
     xxhash.c
-    lz4.c
-    lz4frame.c
-    lz4hc.c
 )
+
+if(WITH_SSL)
+  list(APPEND sources rdkafka_ssl.c)
+endif()
+
+if(WITH_HDRHISTOGRAM)
+  list(APPEND sources rdhdrhistogram.c)
+endif()
 
 if(WITH_LIBDL OR WIN32)
   list(APPEND sources rddl.c)
@@ -77,12 +83,20 @@ if(WITH_SASL_SCRAM)
   list(APPEND sources rdkafka_sasl_scram.c)
 endif()
 
+if(WITH_SASL_OAUTHBEARER)
+  list(APPEND sources rdkafka_sasl_oauthbearer.c)
+endif()
+
 if(WITH_ZLIB)
   list(APPEND sources rdgz.c)
 endif()
 
 if(WITH_ZSTD)
   list(APPEND sources rdkafka_zstd.c)
+endif()
+
+if(NOT WITH_LZ4_EXT)
+  list(APPEND sources lz4.c lz4frame.c lz4hc.c)
 endif()
 
 if(NOT HAVE_REGEX)
@@ -107,6 +121,9 @@ if(WITHOUT_WIN32_CONFIG)
   if(WITH_SASL_SCRAM)
     list(APPEND rdkafka_compile_definitions WITH_SASL_SCRAM)
   endif(WITH_SASL_SCRAM)
+  if(WITH_SASL_OAUTHBEARER)
+    list(APPEND rdkafka_compile_definitions WITH_SASL_OAUTHBEARER)
+  endif(WITH_SASL_OAUTHBEARER)
   if(ENABLE_DEVEL)
     list(APPEND rdkafka_compile_definitions ENABLE_DEVEL)
   endif(ENABLE_DEVEL)
@@ -147,14 +164,16 @@ set(dummy "${GENERATED_DIR}/dummy")
 file(MAKE_DIRECTORY "${dummy}")
 target_include_directories(rdkafka PUBLIC "$<BUILD_INTERFACE:${dummy}>")
 
+if(WITH_HDRHISTOGRAM)
+  target_link_libraries(rdkafka PUBLIC m)
+endif()
+
 if(WITH_ZLIB)
   find_package(ZLIB REQUIRED)
   target_link_libraries(rdkafka PUBLIC ZLIB::ZLIB)
 endif()
 
 if(WITH_ZSTD)
-  find_library (ZSTD_LIBRARY zstd)
-  find_path (ZSTD_INCLUDE_DIR NAMES zstd.h)
   target_link_libraries(rdkafka PUBLIC ${ZSTD_LIBRARY})
   target_include_directories(rdkafka PUBLIC ${ZSTD_INCLUDE_DIR})
   message(STATUS "Found ZSTD: ${ZSTD_LIBRARY}")
@@ -189,6 +208,10 @@ if(WITH_LIBDL)
   target_link_libraries(rdkafka PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
+if(WITH_LZ4_EXT)
+  target_link_libraries(rdkafka PUBLIC LZ4::LZ4)
+endif()
+
 # Set up path to these sources for other sub-projects (tests, examples)
 # to be able to reach them.
 #set(rdkafka_SRC_DIR ${PROJECT_SOURCE_DIR}
@@ -217,6 +240,9 @@ endif()
 if(WITH_ZSTD)
     string(APPEND PKG_CONFIG_REQUIRES "libzstd ")
 endif()
+if(WITH_LZ4_EXT)
+    string(APPEND PKG_CONFIG_REQUIRES "liblz4 ")
+endif()
 set(PKG_CONFIG_CFLAGS
     "-I\${includedir}"
 )
@@ -232,6 +258,9 @@ if(RT_LIBRARY)
 endif()
 if(WITH_PLUGINS)
   string(APPEND PKG_CONFIG_LIBS_PRIVATE " -ldl")
+endif()
+if(WITH_HDRHISTOGRAM)
+  string(APPEND PKG_CONFIG_LIBS_PRIVATE " -lm")
 endif()
 configure_file(
   "../packaging/cmake/rdkafka.pc.in"
